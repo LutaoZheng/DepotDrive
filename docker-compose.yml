@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: depot
+      POSTGRES_PASSWORD: depot
+      POSTGRES_DB: depot_drive
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U depot -d depot_drive"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://depot:depot@postgres:5432/depot_drive
+      JWT_SECRET: ${JWT_SECRET:-development-only-secret-change-me-123456}
+      API_PORT: 3000
+      WEB_ORIGIN: http://localhost:5173
+      COOKIE_SECURE: "false"
+      JWT_SESSION_SECONDS: 604800
+      MAX_FILE_SIZE_BYTES: 524288000
+      UPLOAD_ROOT: /data/uploads
+    ports: ["3000:3000"]
+    volumes:
+      - uploads_data:/data/uploads
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:3000
+    depends_on: [api]
+    ports: ["5173:80"]
+volumes:
+  postgres_data:
+  uploads_data:

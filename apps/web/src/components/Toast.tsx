@@ -1,0 +1,1 @@
+export function Toast({message,onClose}:{message:string;onClose:()=>void}){return <div role="status" className="fixed bottom-5 right-5 z-50 flex max-w-sm items-center gap-4 rounded-xl bg-slate-900 px-4 py-3 text-sm text-white shadow-xl"><span>{message}</span><button onClick={onClose} aria-label="Close">×</button></div>}

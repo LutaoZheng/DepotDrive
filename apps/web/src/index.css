@@ -1,0 +1,3 @@
+@tailwind base;@tailwind components;@tailwind utilities;
+@layer base{body{@apply m-0 bg-slate-50 text-slate-800 antialiased}button,input{@apply outline-none}button:focus-visible,input:focus-visible{@apply ring-2 ring-brand-500 ring-offset-2}}
+@layer components{.btn{@apply inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50}.btn-primary{@apply btn bg-brand-600 text-white hover:bg-brand-700}.btn-secondary{@apply btn border border-slate-300 bg-white hover:bg-slate-50}.input{@apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 focus:border-brand-500}.card{@apply rounded-2xl border border-slate-200 bg-white shadow-sm}}

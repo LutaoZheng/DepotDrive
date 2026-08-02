@@ -1,0 +1,14 @@
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE TABLE "User" ("id" UUID NOT NULL, "email" TEXT NOT NULL, "passwordHash" TEXT NOT NULL, "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL, CONSTRAINT "User_pkey" PRIMARY KEY ("id"));
+CREATE TABLE "Folder" ("id" UUID NOT NULL, "ownerId" UUID NOT NULL, "parentId" UUID, "name" TEXT NOT NULL, "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL, CONSTRAINT "Folder_pkey" PRIMARY KEY ("id"));
+CREATE TABLE "File" ("id" UUID NOT NULL, "ownerId" UUID NOT NULL, "folderId" UUID, "name" TEXT NOT NULL, "originalName" TEXT NOT NULL, "mimeType" TEXT NOT NULL, "sizeBytes" BIGINT NOT NULL, "storageKey" TEXT NOT NULL, "checksum" TEXT NOT NULL, "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL, CONSTRAINT "File_pkey" PRIMARY KEY ("id"));
+CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
+CREATE UNIQUE INDEX "Folder_nested_name_key" ON "Folder"("ownerId", "parentId", "name") WHERE "parentId" IS NOT NULL;
+CREATE UNIQUE INDEX "Folder_root_name_key" ON "Folder"("ownerId", "name") WHERE "parentId" IS NULL;
+CREATE INDEX "Folder_ownerId_parentId_idx" ON "Folder"("ownerId", "parentId");
+CREATE UNIQUE INDEX "File_storageKey_key" ON "File"("storageKey");
+CREATE INDEX "File_ownerId_folderId_idx" ON "File"("ownerId", "folderId");
+ALTER TABLE "Folder" ADD CONSTRAINT "Folder_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "Folder" ADD CONSTRAINT "Folder_parentId_fkey" FOREIGN KEY ("parentId") REFERENCES "Folder"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "File" ADD CONSTRAINT "File_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "File" ADD CONSTRAINT "File_folderId_fkey" FOREIGN KEY ("folderId") REFERENCES "Folder"("id") ON DELETE RESTRICT ON UPDATE CASCADE;

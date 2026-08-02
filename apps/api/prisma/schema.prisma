@@ -1,0 +1,51 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  folders      Folder[]
+  files        File[]
+}
+
+model Folder {
+  id        String   @id @default(uuid()) @db.Uuid
+  ownerId   String   @db.Uuid
+  parentId  String?  @db.Uuid
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  parent    Folder?  @relation("FolderTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children  Folder[] @relation("FolderTree")
+  files     File[]
+
+  @@index([ownerId, parentId])
+}
+
+model File {
+  id           String   @id @default(uuid()) @db.Uuid
+  ownerId      String   @db.Uuid
+  folderId     String?  @db.Uuid
+  name         String
+  originalName String
+  mimeType     String
+  sizeBytes    BigInt
+  storageKey   String   @unique
+  checksum     String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  owner        User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  folder       Folder?  @relation(fields: [folderId], references: [id], onDelete: Restrict)
+
+  @@index([ownerId, folderId])
+}

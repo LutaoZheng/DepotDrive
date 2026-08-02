@@ -1,0 +1,2 @@
+import type { FastifyInstance } from 'fastify'; import { prisma } from '../../plugins/prisma.js'; import { authenticate } from '../../middleware/auth.js';
+export async function userRoutes(app:FastifyInstance){app.addHook('preHandler',authenticate);app.get('/storage',async req=>{const result=await prisma.file.aggregate({where:{ownerId:req.user.sub},_sum:{sizeBytes:true}});return{usedBytes:Number(result._sum.sizeBytes??0n)}});}
