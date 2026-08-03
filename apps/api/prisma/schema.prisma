@@ -8,26 +8,69 @@ datasource db {
 }
 
 model User {
-  id           String   @id @default(uuid()) @db.Uuid
-  email        String   @unique
-  passwordHash String
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-  folders      Folder[]
-  files        File[]
+  id             String          @id @default(uuid()) @db.Uuid
+  email          String          @unique
+  passwordHash   String
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  folders        Folder[]
+  files          File[]
+  uploadSessions UploadSession[]
+}
+
+enum UploadSessionStatus {
+  ACTIVE
+  COMPLETING
+}
+
+model UploadSession {
+  id             String              @id @default(uuid()) @db.Uuid
+  ownerId        String              @db.Uuid
+  folderId       String?             @db.Uuid
+  name           String
+  originalName   String
+  mimeType       String
+  sizeBytes      BigInt
+  fileChecksum   String
+  chunkSizeBytes Int
+  totalChunks    Int
+  status         UploadSessionStatus @default(ACTIVE)
+  expiresAt      DateTime
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+  owner          User                @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  folder         Folder?             @relation(fields: [folderId], references: [id], onDelete: Restrict)
+  chunks         UploadChunk[]
+
+  @@index([ownerId, expiresAt])
+  @@index([expiresAt])
+}
+
+model UploadChunk {
+  id              String        @id @default(uuid()) @db.Uuid
+  uploadSessionId String        @db.Uuid
+  chunkIndex      Int
+  sizeBytes       Int
+  checksum        String
+  createdAt       DateTime      @default(now())
+  uploadSession   UploadSession @relation(fields: [uploadSessionId], references: [id], onDelete: Cascade)
+
+  @@unique([uploadSessionId, chunkIndex])
+  @@index([uploadSessionId])
 }
 
 model Folder {
-  id        String   @id @default(uuid()) @db.Uuid
-  ownerId   String   @db.Uuid
-  parentId  String?  @db.Uuid
-  name      String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
-  parent    Folder?  @relation("FolderTree", fields: [parentId], references: [id], onDelete: Restrict)
-  children  Folder[] @relation("FolderTree")
-  files     File[]
+  id             String          @id @default(uuid()) @db.Uuid
+  ownerId        String          @db.Uuid
+  parentId       String?         @db.Uuid
+  name           String
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  owner          User            @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  parent         Folder?         @relation("FolderTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children       Folder[]        @relation("FolderTree")
+  files          File[]
+  uploadSessions UploadSession[]
 
   @@index([ownerId, parentId])
 }

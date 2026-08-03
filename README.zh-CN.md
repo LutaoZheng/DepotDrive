@@ -1,17 +1,18 @@
-# DepotDrive V0.1
+# DepotDrive V0.2
 
 [English](./README.md) | 简体中文
 
 ## 项目简介
 
-DepotDrive 是一个可自行部署的私人云盘 MVP，支持账户认证、无限层级文件夹、流式上传和下载、文件元数据管理，以及严格的用户数据隔离。V0.1 采用单节点架构，同时通过存储接口为后续分块上传和分布式存储演进保留清晰边界。
+DepotDrive 是一个可自行部署的私人云盘。V0.2 在保持单节点模块化单体架构的同时，加入客户端分块、并发上传、断点续传、chunk 与最终文件 SHA-256 校验。
 
 ## 功能
 
 - 注册、登录、退出及 Cookie 会话恢复
 - 浏览根目录和无限层级文件夹，支持面包屑导航
 - 创建、重命名文件夹，删除空文件夹
-- 最大 500 MB 流式上传，显示上传进度并计算 SHA-256
+- 默认 8 MiB 分块、最多 4 个并发 worker、缺失 chunk 恢复和上传取消
+- 每个 chunk 及最终组装文件均执行 SHA-256 校验
 - 流式下载、文件展示名重命名及文件删除
 - 当前用户存储用量、加载/错误/空状态和响应式 Drive 界面
 - 所有资源查询均按用户隔离，访问其他用户资源统一返回 404
@@ -34,7 +35,7 @@ flowchart TD
   Storage --> FS[(本地文件系统)]
 ```
 
-Fastify API 是模块化单体应用。HTTP 路由通过 Prisma 访问元数据，通过 `FileStorage` 接口访问二进制文件。V0.1 使用 `LocalFileStorage`；后续可替换为分布式 Storage Client，而无需在业务代码中散落文件系统操作。
+Fastify API 是模块化单体应用。HTTP 路由通过 Prisma 访问元数据，通过 `FileStorage` 接口访问二进制文件。V0.2 仍使用 `LocalFileStorage`；后续可替换为分布式 Storage Client，而无需在业务代码中散落文件系统操作。
 
 ## 数据库 ER 图
 
@@ -42,8 +43,11 @@ Fastify API 是模块化单体应用。HTTP 路由通过 Prisma 访问元数据�
 erDiagram
   User ||--o{ Folder : owns
   User ||--o{ File : owns
+  User ||--o{ UploadSession : owns
   Folder o|--o{ Folder : contains
   Folder o|--o{ File : contains
+  Folder o|--o{ UploadSession : targets
+  UploadSession ||--o{ UploadChunk : contains
 
   User {
     uuid id PK
@@ -74,6 +78,26 @@ erDiagram
     string checksum
     datetime createdAt
     datetime updatedAt
+  }
+
+  UploadSession {
+    uuid id PK
+    uuid ownerId FK
+    uuid folderId FK
+    bigint sizeBytes
+    string fileChecksum
+    int chunkSizeBytes
+    int totalChunks
+    string status
+    datetime expiresAt
+  }
+
+  UploadChunk {
+    uuid id PK
+    uuid uploadSessionId FK
+    int chunkIndex
+    int sizeBytes
+    string checksum
   }
 ```
 
@@ -124,10 +148,12 @@ Compose 会启动带健康检查的 PostgreSQL，等待数据库就绪后启动 
 | `DATABASE_URL` | PostgreSQL 连接字符串 |
 | `JWT_SECRET` | JWT 签名密钥；非测试环境至少 32 个字符 |
 | `JWT_SESSION_SECONDS` | JWT 与 Cookie 的统一有效期，默认 604800 秒（7 天） |
+| `CHUNK_SIZE_BYTES` | 服务端指定的 chunk 大小，默认 8388608（8 MiB） |
+| `UPLOAD_SESSION_TTL_SECONDS` | 可恢复上传会话有效期，默认 86400 秒（24 小时） |
 | `API_PORT` | API 端口，默认 `3000` |
 | `WEB_ORIGIN` | 允许携带凭据的前端 CORS origin |
 | `COOKIE_SECURE` | 生产 HTTPS 环境设为 `true` |
-| `MAX_FILE_SIZE_BYTES` | 单文件上传上限，默认 500 MB |
+| `MAX_FILE_SIZE_BYTES` | 单文件上传上限，默认 5368709120 字节（5 GiB） |
 | `UPLOAD_ROOT` | 临时文件与对象文件的存储根目录 |
 | `VITE_API_BASE_URL` | 前端构建时写入的 API 地址 |
 
@@ -171,6 +197,10 @@ TEST_DATABASE_URL=postgresql://depot:depot@localhost:5432/depot_drive_test npm r
 | GET | `/api/files/:fileId/download` | 流式下载 |
 | PATCH/DELETE | `/api/files/:fileId` | 重命名元数据／删除文件 |
 | GET | `/api/users/storage` | 当前用户已用字节数 |
+| POST/GET | `/api/uploads` | 创建或恢复／列出活跃上传 Session |
+| GET/DELETE | `/api/uploads/:uploadId` | 查询进度／取消并清理 Session |
+| PUT | `/api/uploads/:uploadId/chunks/:chunkIndex` | 流式上传并校验单个 chunk |
+| POST | `/api/uploads/:uploadId/complete` | 组装、校验并发布文件 |
 
 错误统一使用：
 
@@ -185,7 +215,7 @@ TEST_DATABASE_URL=postgresql://depot:depot@localhost:5432/depot_drive_test npm r
 
 ## 文件存储设计
 
-上传数据首先流入 `uploads/tmp/<uuid>.part`，同时计算 SHA-256 和字节数。完成后原子移动到 `uploads/objects/ab/cd/<uuid>`，避免单目录对象过多。storage key 只接受服务端 UUID，原始文件名仅作为元数据保存，从而防止路径穿越。下载同样使用流，不会把完整文件加载进内存。
+旧版上传仍流入 `uploads/tmp/<uuid>.part`。V0.2 chunk 独立校验后原子保存到 `uploads/sessions/<sessionId>/chunks/<index>`。complete 按 index 流式读取，不将完整文件载入内存；验证最终大小和 SHA-256 后，原子移动到 `uploads/objects/ab/cd/<uuid>`。完成、取消或过期时清理 Session 目录。
 
 ## 安全设计
 
@@ -201,26 +231,28 @@ TEST_DATABASE_URL=postgresql://depot:depot@localhost:5432/depot_drive_test npm r
 
 ## 文件系统与数据库一致性
 
-上传顺序为：临时流写入 → checksum → 原子移动 → 插入元数据。流写入失败时删除 `.part`；数据库插入失败时补偿删除正式对象，因此不会在文件落盘前发布元数据。
+chunk 顺序为：临时流写入 → 大小/checksum 校验 → 原子移动 → chunk 元数据。complete 会原子抢占 Session 状态，按序流式组装，校验最终大小/checksum，移动 object，再以数据库事务创建 `File` 并删除 Session。元数据发布失败时删除 object，并把 Session 恢复为 ACTIVE 供重试。
 
 删除采用磁盘优先、数据库随后。磁盘文件已不存在时仍允许删除元数据，防止损坏记录无法清理。如果磁盘删除后数据库暂时不可用，重试会再次容忍磁盘文件缺失并删除元数据。
 
-V0.1 不具备跨数据库/文件系统事务、垃圾回收、对象对账、复制或恢复日志。生产运维应同时备份 PostgreSQL 和 uploads volume。
+V0.2 不具备跨数据库/文件系统事务、孤儿对象对账、复制或恢复日志。生产运维应同时备份 PostgreSQL 和 uploads volume。
 
 ## 当前限制
 
 - 单 API 节点和本地文件系统
-- 单请求单文件，不支持分块、断点续传、并行上传或 Range 下载
+- 每个任务选择一个文件；暂不支持 Range 下载
 - 不支持分享、配额、预览、搜索和回收站
 - 文件夹只允许空目录删除，文件删除为永久删除
 - 生产环境需要 HTTPS 反向代理并设置 `COOKIE_SECURE=true`
+- Pause/Resume 支持当前页面生命周期。刷新会丢失浏览器 `File` 对象，本版本需重新开始；服务端 Session 与 chunks 会保留，为后续“重新选择相同文件恢复”流程提供基础。
 
-## V0.2 计划
+## V0.2 上传设计
 
-- 客户端文件分块
-- 可恢复上传会话
-- 并行分块上传
-- 上传恢复
-- 分块 checksum 校验
+- 客户端增量计算最终 SHA-256
+- 8 MiB 分块和 4 个并发上传 worker
+- UploadSession/UploadChunk 持久化与缺失 chunk 查询
+- chunk SHA-256、顺序流式组装和最终 SHA-256 校验
+- 独立的 Pause/Resume（以服务端缺失 chunk 为准）、永久 Cancel、启动清理与每小时过期 Session 清理
+- 网络错误和 5xx chunk 请求按 500/1000/2000 ms 退避重试，4xx 不重试
 
-V0.2 将引入上传会话模型和可替换的 Storage Client。每个分块拥有独立 checksum，组装完成后通过最终清单和总校验值验证，再发布文件元数据。
+旧 multipart 上传接口继续保留以兼容 V0.1 客户端。V0.2 仍严格保持单节点，不引入 Redis、消息队列、分布式锁、副本、S3 或 Storage Node 协调。

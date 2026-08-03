@@ -1,17 +1,18 @@
-# DepotDrive V0.1
+# DepotDrive V0.2
 
 English | [简体中文](./README.zh-CN.md)
 
 ## Overview
 
-DepotDrive is a self-hosted private cloud drive MVP. It provides account authentication, nested folders, streamed uploads/downloads, metadata management, and strict per-user isolation on a single node.
+DepotDrive is a self-hosted private cloud drive. V0.2 adds chunked, parallel, resumable uploads with per-chunk and final SHA-256 validation while retaining the single-node modular-monolith architecture.
 
 ## Features
 
 - Register, sign in, sign out, and restore a cookie-based session
 - Browse root and arbitrarily nested folders with breadcrumbs
 - Create, rename, and delete empty folders
-- Stream files up to 500 MB with progress, SHA-256 checksums, and atomic placement
+- Split files into 8 MiB chunks, upload up to four chunks in parallel, resume missing chunks, and cancel uploads
+- Validate every chunk and the assembled file with SHA-256 before publishing metadata
 - Stream downloads; rename display metadata; delete metadata and disk content
 - Per-user storage totals, loading/error/empty states, and responsive Drive UI
 - Owner-scoped resource lookups that return 404 for another user's resources
@@ -30,7 +31,7 @@ flowchart TD
   Storage --> FS[(Local Filesystem)]
 ```
 
-The HTTP routes delegate persistence to Prisma and binary operations to the `FileStorage` interface. `LocalFileStorage` is the V0.1 implementation; a future storage client can replace it without putting filesystem calls in business routes.
+The HTTP routes delegate persistence to Prisma and binary operations to the `FileStorage` interface. `LocalFileStorage` remains the V0.2 implementation; a future storage client can replace it without putting filesystem calls in business routes.
 
 ## Database ER diagram
 
@@ -38,8 +39,11 @@ The HTTP routes delegate persistence to Prisma and binary operations to the `Fil
 erDiagram
   User ||--o{ Folder : owns
   User ||--o{ File : owns
+  User ||--o{ UploadSession : owns
   Folder o|--o{ Folder : contains
   Folder o|--o{ File : contains
+  Folder o|--o{ UploadSession : targets
+  UploadSession ||--o{ UploadChunk : contains
 
   User {
     uuid id PK
@@ -70,6 +74,26 @@ erDiagram
     string checksum
     datetime createdAt
     datetime updatedAt
+  }
+
+  UploadSession {
+    uuid id PK
+    uuid ownerId FK
+    uuid folderId FK
+    bigint sizeBytes
+    string fileChecksum
+    int chunkSizeBytes
+    int totalChunks
+    string status
+    datetime expiresAt
+  }
+
+  UploadChunk {
+    uuid id PK
+    uuid uploadSessionId FK
+    int chunkIndex
+    int sizeBytes
+    string checksum
   }
 ```
 
@@ -119,7 +143,9 @@ Compose starts PostgreSQL with a healthcheck, waits before starting the API, app
 | `WEB_ORIGIN` | Exact allowed browser CORS origin |
 | `COOKIE_SECURE` | Set `true` behind production HTTPS |
 | `JWT_SESSION_SECONDS` | JWT and cookie lifetime in seconds, default 604800 (7 days) |
-| `MAX_FILE_SIZE_BYTES` | Per-file upload limit, default 500 MB |
+| `CHUNK_SIZE_BYTES` | Server-selected chunk size, default 8388608 (8 MiB) |
+| `UPLOAD_SESSION_TTL_SECONDS` | Resumable session lifetime, default 86400 (24 hours) |
+| `MAX_FILE_SIZE_BYTES` | Per-file upload limit, default 5368709120 bytes (5 GiB) |
 | `UPLOAD_ROOT` | Temporary/object storage root |
 | `VITE_API_BASE_URL` | Browser-visible API origin, embedded at web build time |
 
@@ -161,12 +187,16 @@ Without `TEST_DATABASE_URL`, database integration tests are explicitly skipped r
 | GET | `/api/files/:fileId/download` | Stream download |
 | PATCH/DELETE | `/api/files/:fileId` | Rename metadata / delete file |
 | GET | `/api/users/storage` | Current user's bytes used |
+| POST/GET | `/api/uploads` | Create-or-resume / list active upload sessions |
+| GET/DELETE | `/api/uploads/:uploadId` | Get progress / cancel and clean a session |
+| PUT | `/api/uploads/:uploadId/chunks/:chunkIndex` | Stream and verify one binary chunk |
+| POST | `/api/uploads/:uploadId/complete` | Assemble, verify, and publish the file |
 
 Errors consistently use `{ "error": { "code": "...", "message": "..." } }`.
 
 ## File storage design
 
-Uploads stream into `uploads/tmp/<uuid>.part` while calculating SHA-256 and byte count. Completion atomically renames the file to `uploads/objects/ab/cd/<uuid>`, spreading objects across directories. UUID-only validated storage keys and server-built paths prevent traversal; original names are metadata only. Downloads remain streams and their route is ready to grow Range handling later.
+Legacy uploads still stream into `uploads/tmp/<uuid>.part`. V0.2 chunks are independently verified and atomically stored at `uploads/sessions/<sessionId>/chunks/<index>`. Completion reads chunks in index order without loading the full file, validates final size and SHA-256, then atomically moves the assembled object to `uploads/objects/ab/cd/<uuid>`. Session directories are removed after completion, cancellation, or expiry.
 
 ## Security
 
@@ -182,24 +212,26 @@ Uploads stream into `uploads/tmp/<uuid>.part` while calculating SHA-256 and byte
 
 ## Filesystem and Database Consistency
 
-Upload order is temporary stream → checksum → atomic final move → metadata insert. A stream failure removes the `.part`; a metadata failure compensates by deleting the final object. Thus metadata is never inserted before content is durable at its final path.
+Chunk upload order is temporary chunk stream → size/checksum validation → atomic chunk move → chunk metadata insert. Completion atomically claims the session, streams chunks into an assembly temp file, validates the final size/checksum, moves the object, then creates `File` metadata and deletes session metadata in one database transaction. An object is deleted if metadata publication fails, and the session returns to ACTIVE for retry.
 
-Delete intentionally removes disk content first, then metadata. A missing disk object is accepted (`force` semantics), allowing damaged metadata to be cleaned up. A database outage after disk deletion can temporarily leave metadata pointing to missing content; a retry will again accept the missing object and remove metadata. V0.1 has no cross-system transaction, garbage collector, object reconciliation job, replication, or recovery journal. Operators should back up PostgreSQL and the uploads volume together.
+Delete intentionally removes disk content first, then metadata. A missing disk object is accepted (`force` semantics), allowing damaged metadata to be cleaned up. A database outage after disk deletion can temporarily leave metadata pointing to missing content; a retry will again accept the missing object and remove metadata. V0.2 has no cross-system transaction, orphan-object reconciliation job, replication, or recovery journal. Operators should back up PostgreSQL and the uploads volume together.
 
 ## Current limitations
 
 - Single API node and local filesystem only
-- One file per request; no chunks, resume, parallel upload, Range download, sharing, quotas, previews, search, or trash
+- Single file selection per task; no Range download, sharing, quotas, previews, search, or trash
 - Folder deletion is empty-only and file deletion is permanent
 - Cookies require an HTTPS reverse proxy plus `COOKIE_SECURE=true` in production
 - Upload progress reports browser-to-server transfer progress, not post-upload database completion
+- Pause/resume works while the page remains open. A refresh loses the browser `File` object, so the user must start again in this release; the server session and chunks remain available for a future same-file picker recovery flow.
 
-## V0.2
+## V0.2 upload design
 
-- Client-side chunking
-- Resumable upload sessions
-- Parallel chunk upload
-- Upload recovery
-- Chunk checksum validation
+- Client-side incremental final SHA-256 calculation
+- 8 MiB chunks and four concurrent upload workers
+- Server-side UploadSession/UploadChunk persistence and missing-chunk discovery
+- Per-chunk SHA-256, ordered streaming assembly, and final SHA-256 validation
+- Independent pause/resume (server-authoritative missing-chunk reconciliation), explicit permanent cancellation, and startup/hourly expired-session cleanup
+- Network and 5xx chunk retries use 500/1000/2000 ms backoff; 4xx responses are not retried
 
-V0.2 can add an upload-session model and storage client while retaining the current owner-scoped domain and `FileStorage` boundary. Each chunk will receive an independent checksum, with a final manifest/checksum validating assembly before metadata publication.
+The legacy multipart endpoint remains supported for backward compatibility. V0.2 remains deliberately single-node: no Redis, queues, distributed locks, replicas, S3, or storage-node coordination.

@@ -3,6 +3,7 @@ import jwt from '@fastify/jwt';
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../src/config/env.js';
 import { clearSessionCookieOptions, sessionCookieOptions, sessionJwtOptions } from '../src/modules/auth/session.js';
+import { MAX_UPLOAD_FILE_SIZE } from '@depot-drive/shared';
 
 const env: Env = {
   NODE_ENV: 'development',
@@ -12,7 +13,9 @@ const env: Env = {
   WEB_ORIGIN: 'http://localhost:5173',
   COOKIE_SECURE: false,
   JWT_SESSION_SECONDS: 604_800,
-  MAX_FILE_SIZE_BYTES: 524_288_000,
+  CHUNK_SIZE_BYTES: 8 * 1024 * 1024,
+  UPLOAD_SESSION_TTL_SECONDS: 86_400,
+  MAX_FILE_SIZE_BYTES: MAX_UPLOAD_FILE_SIZE,
   UPLOAD_ROOT: './uploads',
 };
 
