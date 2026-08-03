@@ -6,7 +6,7 @@ export interface StoredChunk { chunkIndex: number; sizeBytes: number; checksum: 
 export interface AssembleChunksInput { sessionId: string; totalChunks: number; storageKey: string; expectedSizeBytes: number; expectedChecksum: string }
 export interface FileStorage {
   save(input: SaveFileInput): Promise<StoredFile>;
-  createReadStream(storageKey: string): NodeJS.ReadableStream;
+  createReadStream(storageKey: string): Readable;
   delete(storageKey: string): Promise<void>;
   exists(storageKey: string): Promise<boolean>;
   pathFor(storageKey: string): string;

@@ -1,0 +1,11 @@
+CREATE TYPE "StorageNodeStatus" AS ENUM ('ALIVE', 'DEAD');
+CREATE TYPE "ReplicaRole" AS ENUM ('PRIMARY', 'REPLICA');
+CREATE TABLE "StorageNode" ("id" TEXT NOT NULL, "name" TEXT NOT NULL, "status" "StorageNodeStatus" NOT NULL DEFAULT 'DEAD', "capacityBytes" BIGINT NOT NULL, "usedBytes" BIGINT NOT NULL DEFAULT 0, "lastHeartbeat" TIMESTAMP(3), "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" TIMESTAMP(3) NOT NULL, CONSTRAINT "StorageNode_pkey" PRIMARY KEY ("id"));
+CREATE TABLE "FileReplica" ("id" UUID NOT NULL, "fileId" UUID NOT NULL, "nodeId" TEXT NOT NULL, "storageKey" TEXT NOT NULL, "role" "ReplicaRole" NOT NULL, "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT "FileReplica_pkey" PRIMARY KEY ("id"));
+CREATE UNIQUE INDEX "StorageNode_name_key" ON "StorageNode"("name");
+CREATE INDEX "StorageNode_status_lastHeartbeat_idx" ON "StorageNode"("status", "lastHeartbeat");
+CREATE UNIQUE INDEX "FileReplica_fileId_nodeId_key" ON "FileReplica"("fileId", "nodeId");
+CREATE INDEX "FileReplica_nodeId_role_idx" ON "FileReplica"("nodeId", "role");
+CREATE INDEX "FileReplica_fileId_role_idx" ON "FileReplica"("fileId", "role");
+ALTER TABLE "FileReplica" ADD CONSTRAINT "FileReplica_fileId_fkey" FOREIGN KEY ("fileId") REFERENCES "File"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "FileReplica" ADD CONSTRAINT "FileReplica_nodeId_fkey" FOREIGN KEY ("nodeId") REFERENCES "StorageNode"("id") ON DELETE RESTRICT ON UPDATE CASCADE;

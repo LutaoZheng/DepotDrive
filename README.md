@@ -1,10 +1,10 @@
-# DepotDrive V0.2
+# DepotDrive V0.3.1
 
 English | [简体中文](./README.zh-CN.md)
 
 ## Overview
 
-DepotDrive is a self-hosted private cloud drive. V0.2 adds chunked, parallel, resumable uploads with per-chunk and final SHA-256 validation while retaining the single-node modular-monolith architecture.
+DepotDrive is a self-hosted private cloud drive. V0.3.1 separates metadata from binary storage and introduces three independently rooted storage nodes, two-copy replication, heartbeat-based failure detection, and replica download fallback.
 
 ## Features
 
@@ -16,6 +16,8 @@ DepotDrive is a self-hosted private cloud drive. V0.2 adds chunked, parallel, re
 - Stream downloads; rename display metadata; delete metadata and disk content
 - Per-user storage totals, loading/error/empty states, and responsive Drive UI
 - Owner-scoped resource lookups that return 404 for another user's resources
+- Two copies per new file across Storage A/B/C with primary-to-replica download fallback
+- Storage-node heartbeat, 30-second failure detection, capacity accounting, and a live dashboard
 
 ## Technology
 
@@ -25,13 +27,20 @@ React, TypeScript, Vite, Tailwind CSS, React Router, TanStack Query, and Axios p
 
 ```mermaid
 flowchart TD
-  Web[React Web] --> API[Fastify API]
-  API --> DB[(PostgreSQL Metadata)]
-  API --> Storage[LocalFileStorage]
-  Storage --> FS[(Local Filesystem)]
+  Web[React Web] --> API[Fastify Metadata Service]
+  API --> DB[(PostgreSQL File, Node and Replica Metadata)]
+  API --> Registry[Storage Node Registry]
+  Registry --> A[Storage Node A]
+  Registry --> B[Storage Node B]
+  Registry --> C[Storage Node C]
+  A --> AFS[(storage-nodes/A)]
+  B --> BFS[(storage-nodes/B)]
+  C --> CFS[(storage-nodes/C)]
+  Heartbeat[Heartbeat and Failure Detector] --> Registry
+  Heartbeat --> DB
 ```
 
-The HTTP routes delegate persistence to Prisma and binary operations to the `FileStorage` interface. `LocalFileStorage` remains the V0.2 implementation; a future storage client can replace it without putting filesystem calls in business routes.
+The Fastify modular monolith currently hosts the Metadata Service, but binary storage is behind a transport-neutral `StorageNode` interface. `StorageNodeLocal` gives A/B/C separate roots today; later remote implementations can replace individual nodes without changing upload or download routes. `LocalFileStorage` remains the staging and V0.2 compatibility implementation.
 
 ## Database ER diagram
 
@@ -44,6 +53,8 @@ erDiagram
   Folder o|--o{ File : contains
   Folder o|--o{ UploadSession : targets
   UploadSession ||--o{ UploadChunk : contains
+  File ||--o{ FileReplica : has
+  StorageNode ||--o{ FileReplica : stores
 
   User {
     uuid id PK
@@ -187,6 +198,7 @@ Without `TEST_DATABASE_URL`, database integration tests are explicitly skipped r
 | GET | `/api/files/:fileId/download` | Stream download |
 | PATCH/DELETE | `/api/files/:fileId` | Rename metadata / delete file |
 | GET | `/api/users/storage` | Current user's bytes used |
+| GET | `/api/storage/nodes` | Node health, capacity, heartbeat, primary and replica counts |
 | POST/GET | `/api/uploads` | Create-or-resume / list active upload sessions |
 | GET/DELETE | `/api/uploads/:uploadId` | Get progress / cancel and clean a session |
 | PUT | `/api/uploads/:uploadId/chunks/:chunkIndex` | Stream and verify one binary chunk |
@@ -212,9 +224,9 @@ Legacy uploads still stream into `uploads/tmp/<uuid>.part`. V0.2 chunks are inde
 
 ## Filesystem and Database Consistency
 
-Chunk upload order is temporary chunk stream → size/checksum validation → atomic chunk move → chunk metadata insert. Completion atomically claims the session, streams chunks into an assembly temp file, validates the final size/checksum, moves the object, then creates `File` metadata and deletes session metadata in one database transaction. An object is deleted if metadata publication fails, and the session returns to ACTIVE for retry.
+Chunk upload order is temporary chunk stream → size/checksum validation → atomic chunk move → chunk metadata insert. Completion atomically claims the session, streams chunks into an assembly temp file, validates it, then streams it to two distinct node roots. `File`, both `FileReplica` rows, and UploadSession removal are published in one database transaction. A failed transaction triggers deletion of both physical replicas and returns the session to ACTIVE; compensation deletion failures are logged with node and storage key.
 
-Delete intentionally removes disk content first, then metadata. A missing disk object is accepted (`force` semantics), allowing damaged metadata to be cleaned up. A database outage after disk deletion can temporarily leave metadata pointing to missing content; a retry will again accept the missing object and remove metadata. V0.2 has no cross-system transaction, orphan-object reconciliation job, replication, or recovery journal. Operators should back up PostgreSQL and the uploads volume together.
+New-file deletion attempts every replica before deleting metadata. If any node deletion fails, the API returns `REPLICA_DELETE_FAILED` and retains the File/FileReplica rows so the failure remains traceable and deletion can be retried. A replica deleted successfully before another fails is recorded as temporarily missing. Legacy V0.2 files retain force-delete behavior on `LocalFileStorage`. There is no cross-system transaction or orphan reconciliation job, so operators should back up PostgreSQL and the uploads volume together.
 
 ## Current limitations
 
@@ -224,6 +236,18 @@ Delete intentionally removes disk content first, then metadata. A missing disk o
 - Cookies require an HTTPS reverse proxy plus `COOKIE_SECURE=true` in production
 - Upload progress reports browser-to-server transfer progress, not post-upload database completion
 - Pause/resume works while the page remains open. A refresh loses the browser `File` object, so the user must start again in this release; the server session and chunks remain available for a future same-file picker recovery flow.
+- Storage nodes are local-directory implementations in one API process. V0.3.1 intentionally has no remote RPC, repair, rebalancing, consistent hashing, leader election, or consensus.
+- A single API process owns all three simulated local nodes; stopping that process stops A, B, and C together. This is fault-path simulation, not three independent remote servers.
+- Relative `UPLOAD_ROOT` values are resolved once against the monorepo workspace root, not the process working directory. The documented default is the absolute equivalent of `apps/api/uploads`.
+- Download fallback covers node status, health, missing objects, and failures while opening a stream. Once response bytes have reached the client, a later stream failure cannot safely switch replicas in the same HTTP response; the client must retry the download.
+
+## V0.3.1 distributed storage design
+
+- Metadata Service owns file, node, and replica placement records in PostgreSQL
+- Storage A/B/C use isolated filesystem roots and implement the transport-neutral `StorageNode` contract
+- Every new file requires a PRIMARY and one REPLICA before metadata publication
+- Heartbeats run every 10 seconds; metadata older than 30 seconds is marked DEAD
+- Downloads skip DEAD/unhealthy/missing primary content and fall back to the replica
 
 ## V0.2 upload design
 
@@ -234,4 +258,4 @@ Delete intentionally removes disk content first, then metadata. A missing disk o
 - Independent pause/resume (server-authoritative missing-chunk reconciliation), explicit permanent cancellation, and startup/hourly expired-session cleanup
 - Network and 5xx chunk retries use 500/1000/2000 ms backoff; 4xx responses are not retried
 
-The legacy multipart endpoint remains supported for backward compatibility. V0.2 remains deliberately single-node: no Redis, queues, distributed locks, replicas, S3, or storage-node coordination.
+The legacy multipart endpoint and V0.2 files remain supported for backward compatibility. V0.3.1 adds local replica simulation without Redis, queues, distributed locks, S3, remote RPC, or storage-node consensus.

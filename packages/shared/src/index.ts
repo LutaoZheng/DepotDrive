@@ -29,3 +29,5 @@ export interface UploadSessionDto {
 }
 export interface CreateUploadSessionRequest { folderId: string | null; name: string; mimeType: string; sizeBytes: number; fileChecksum: string }
 export interface CreateUploadSessionResponse { upload: UploadSessionDto }
+export interface StorageNodeDto { id: string; name: string; alive: boolean; capacityBytes: number; usedBytes: number; primaryCount: number; replicaCount: number; lastHeartbeat: string | null }
+export interface StorageNodesResponse { nodes: StorageNodeDto[] }

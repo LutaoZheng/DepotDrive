@@ -17,6 +17,9 @@ const env: Env = {
   UPLOAD_SESSION_TTL_SECONDS: 86_400,
   MAX_FILE_SIZE_BYTES: MAX_UPLOAD_FILE_SIZE,
   UPLOAD_ROOT: './uploads',
+  STORAGE_NODE_CAPACITY_BYTES: 100 * 1024 * 1024 * 1024,
+  HEARTBEAT_INTERVAL_MS: 10_000,
+  STORAGE_FAILURE_TIMEOUT_MS: 30_000,
 };
 
 describe('authentication session lifecycle', () => {

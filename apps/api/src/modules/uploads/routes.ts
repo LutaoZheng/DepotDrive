@@ -10,7 +10,7 @@ const sha256=z.string().regex(/^[a-f0-9]{64}$/i);
 const createBody=z.object({folderId:z.string().uuid().nullable(),name:safeName,mimeType:z.string().max(255).default('application/octet-stream'),sizeBytes:z.number().int().nonnegative(),fileChecksum:sha256});
 const sessionParams=z.object({uploadId:z.string().uuid()});const chunkParams=z.object({uploadId:z.string().uuid(),chunkIndex:z.coerce.number().int().nonnegative()});
 
-export async function uploadRoutes(app:FastifyInstance){app.addHook('preHandler',authenticate);const service=new UploadService(app.storage,{chunkSizeBytes:app.config.CHUNK_SIZE_BYTES,maxFileSizeBytes:app.config.MAX_FILE_SIZE_BYTES,ttlSeconds:app.config.UPLOAD_SESSION_TTL_SECONDS});
+export async function uploadRoutes(app:FastifyInstance){app.addHook('preHandler',authenticate);const service=new UploadService(app.storage,app.replicas,app.storageMetadata,{chunkSizeBytes:app.config.CHUNK_SIZE_BYTES,maxFileSizeBytes:app.config.MAX_FILE_SIZE_BYTES,ttlSeconds:app.config.UPLOAD_SESSION_TTL_SECONDS});
  app.post('/',async(req,reply)=>{const parsed=createBody.safeParse(req.body);if(!parsed.success)return fail(reply,400,'VALIDATION_ERROR',parsed.error.issues[0]?.message??'Invalid upload');return reply.code(201).send({upload:await service.create(req.user.sub,parsed.data)});});
  app.get('/',async req=>({uploads:await service.list(req.user.sub)}));
  app.get('/:uploadId',async(req,reply)=>{const parsed=sessionParams.safeParse(req.params);if(!parsed.success)return fail(reply,400,'VALIDATION_ERROR','Invalid upload id');return{upload:await service.get(req.user.sub,parsed.data.uploadId)}});

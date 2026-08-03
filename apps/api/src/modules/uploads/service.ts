@@ -7,6 +7,8 @@ import { prisma } from '../../plugins/prisma.js';
 import type { FileStorage } from '../../storage/file-storage.js';
 import { AppError } from '../../utils/errors.js';
 import { fileDto } from '../../utils/dto.js';
+import type { ReplicaService } from '../storage/replica-service.js';
+import type { StorageMetadataService } from '../storage/metadata-service.js';
 
 type SessionWithChunks = UploadSession & { chunks: UploadChunk[] };
 const sha256Pattern = /^[a-f0-9]{64}$/i;
@@ -28,7 +30,7 @@ export function uploadSessionDto(session: SessionWithChunks): UploadSessionDto {
 }
 
 export class UploadService {
-  constructor(private storage: FileStorage, private options: { chunkSizeBytes: number; maxFileSizeBytes: number; ttlSeconds: number }) {}
+  constructor(private storage: FileStorage, private replicas: ReplicaService, private metadata: StorageMetadataService, private options: { chunkSizeBytes: number; maxFileSizeBytes: number; ttlSeconds: number }) {}
 
   private expiresAt() { return new Date(Date.now() + this.options.ttlSeconds * 1000); }
   private async ownedSession(id: string, ownerId: string) {
@@ -77,8 +79,11 @@ export class UploadService {
     const storageKey=randomUUID();
     try{
       const stored=await this.storage.assembleChunks({sessionId:id,totalChunks:session.totalChunks,storageKey,expectedSizeBytes:Number(session.sizeBytes),expectedChecksum:session.fileChecksum});
-      const [file]=await prisma.$transaction([prisma.file.create({data:{ownerId,folderId:session.folderId,name:session.name,originalName:session.originalName,mimeType:session.mimeType,sizeBytes:BigInt(stored.sizeBytes),storageKey,checksum:stored.checksum}}),prisma.uploadSession.delete({where:{id}})]);
-      await this.storage.deleteUploadSession(id).catch(()=>undefined);return fileDto(file);
+      const placements=await this.replicas.replicateFrom(this.storage,storageKey);
+      try {
+        const file=await prisma.$transaction(async tx=>{const created=await tx.file.create({data:{ownerId,folderId:session.folderId,name:session.name,originalName:session.originalName,mimeType:session.mimeType,sizeBytes:BigInt(stored.sizeBytes),storageKey,checksum:stored.checksum,replicas:{create:this.metadata.replicaCreateData(placements)}}});await tx.uploadSession.delete({where:{id}});return created;});
+        await this.storage.delete(storageKey).catch(()=>undefined);await this.storage.deleteUploadSession(id).catch(()=>undefined);return fileDto(file);
+      } catch(error) { await this.replicas.deletePlacements(placements); throw error; }
     }catch(error){await this.storage.delete(storageKey).catch(()=>undefined);await prisma.uploadSession.updateMany({where:{id,ownerId,status:UploadSessionStatus.COMPLETING},data:{status:UploadSessionStatus.ACTIVE,expiresAt:this.expiresAt()}}).catch(()=>undefined);const message=error instanceof Error?error.message:'';if(message==='FILE_SIZE_MISMATCH')throw new AppError(422,'FILE_SIZE_MISMATCH','Assembled file size does not match');if(message==='FILE_CHECKSUM_MISMATCH')throw new AppError(422,'FILE_CHECKSUM_MISMATCH','Final file checksum does not match');throw error;}
   }
 

@@ -1,10 +1,10 @@
-# DepotDrive V0.2
+# DepotDrive V0.3.1
 
 [English](./README.md) | 简体中文
 
 ## 项目简介
 
-DepotDrive 是一个可自行部署的私人云盘。V0.2 在保持单节点模块化单体架构的同时，加入客户端分块、并发上传、断点续传、chunk 与最终文件 SHA-256 校验。
+DepotDrive 是一个可自行部署的私人云盘。V0.3.1 首次将元数据与二进制存储解耦，引入三个独立 Storage Node、双副本、心跳故障检测以及下载自动回退。
 
 ## 功能
 
@@ -17,6 +17,8 @@ DepotDrive 是一个可自行部署的私人云盘。V0.2 在保持单节点模�
 - 当前用户存储用量、加载/错误/空状态和响应式 Drive 界面
 - 所有资源查询均按用户隔离，访问其他用户资源统一返回 404
 - 全局 401 会话失效处理和跨用户前端缓存隔离
+- 新文件在 Storage A/B/C 中保存两份，Primary 不可用时自动回退 Replica
+- Storage Node 心跳、30 秒故障检测、容量统计和实时 Dashboard
 
 ## 技术栈
 
@@ -29,13 +31,20 @@ DepotDrive 是一个可自行部署的私人云盘。V0.2 在保持单节点模�
 
 ```mermaid
 flowchart TD
-  Web[React Web] --> API[Fastify API]
-  API --> DB[(PostgreSQL 元数据)]
-  API --> Storage[LocalFileStorage]
-  Storage --> FS[(本地文件系统)]
+  Web[React Web] --> API[Fastify Metadata Service]
+  API --> DB[(PostgreSQL 文件、节点和副本元数据)]
+  API --> Registry[Storage Node Registry]
+  Registry --> A[Storage Node A]
+  Registry --> B[Storage Node B]
+  Registry --> C[Storage Node C]
+  A --> AFS[(storage-nodes/A)]
+  B --> BFS[(storage-nodes/B)]
+  C --> CFS[(storage-nodes/C)]
+  Heartbeat[Heartbeat 与故障检测] --> Registry
+  Heartbeat --> DB
 ```
 
-Fastify API 是模块化单体应用。HTTP 路由通过 Prisma 访问元数据，通过 `FileStorage` 接口访问二进制文件。V0.2 仍使用 `LocalFileStorage`；后续可替换为分布式 Storage Client，而无需在业务代码中散落文件系统操作。
+Fastify 模块化单体当前承载 Metadata Service，但二进制存储已通过与传输无关的 `StorageNode` 接口隔离。`StorageNodeLocal` 为 A/B/C 提供互相独立的根目录；以后可以逐个替换为远程节点而无需修改上传和下载路由。`LocalFileStorage` 继续承担 staging 与 V0.2 旧文件兼容。
 
 ## 数据库 ER 图
 
@@ -48,6 +57,8 @@ erDiagram
   Folder o|--o{ File : contains
   Folder o|--o{ UploadSession : targets
   UploadSession ||--o{ UploadChunk : contains
+  File ||--o{ FileReplica : has
+  StorageNode ||--o{ FileReplica : stores
 
   User {
     uuid id PK
@@ -197,6 +208,7 @@ TEST_DATABASE_URL=postgresql://depot:depot@localhost:5432/depot_drive_test npm r
 | GET | `/api/files/:fileId/download` | 流式下载 |
 | PATCH/DELETE | `/api/files/:fileId` | 重命名元数据／删除文件 |
 | GET | `/api/users/storage` | 当前用户已用字节数 |
+| GET | `/api/storage/nodes` | 节点健康、容量、心跳、Primary 与 Replica 数量 |
 | POST/GET | `/api/uploads` | 创建或恢复／列出活跃上传 Session |
 | GET/DELETE | `/api/uploads/:uploadId` | 查询进度／取消并清理 Session |
 | PUT | `/api/uploads/:uploadId/chunks/:chunkIndex` | 流式上传并校验单个 chunk |
@@ -231,11 +243,9 @@ TEST_DATABASE_URL=postgresql://depot:depot@localhost:5432/depot_drive_test npm r
 
 ## 文件系统与数据库一致性
 
-chunk 顺序为：临时流写入 → 大小/checksum 校验 → 原子移动 → chunk 元数据。complete 会原子抢占 Session 状态，按序流式组装，校验最终大小/checksum，移动 object，再以数据库事务创建 `File` 并删除 Session。元数据发布失败时删除 object，并把 Session 恢复为 ACTIVE 供重试。
+chunk 顺序为：临时流写入 → 大小/checksum 校验 → 原子移动 → chunk 元数据。complete 会原子抢占 Session，按序流式组装和校验，再将内容流式写入两个不同节点根目录。`File`、两条 `FileReplica` 与 UploadSession 删除在同一个数据库 transaction 中发布。transaction 失败会删除两个物理副本并把 Session 恢复为 ACTIVE；补偿删除失败会记录 node 与 storage key 日志。
 
-删除采用磁盘优先、数据库随后。磁盘文件已不存在时仍允许删除元数据，防止损坏记录无法清理。如果磁盘删除后数据库暂时不可用，重试会再次容忍磁盘文件缺失并删除元数据。
-
-V0.2 不具备跨数据库/文件系统事务、孤儿对象对账、复制或恢复日志。生产运维应同时备份 PostgreSQL 和 uploads volume。
+新文件删除会先尝试全部副本，再删除 metadata。任一节点删除失败时 API 返回 `REPLICA_DELETE_FAILED`，并保留 File/FileReplica 记录，使故障仍可追踪并允许重试；其他已成功删除的副本会暂时显示为缺失。V0.2 legacy 文件继续使用 `LocalFileStorage` force-delete 兼容逻辑。当前没有跨数据库/文件系统事务或 orphan reconciliation，生产运维应同时备份 PostgreSQL 和 uploads volume。
 
 ## 当前限制
 
@@ -245,6 +255,18 @@ V0.2 不具备跨数据库/文件系统事务、孤儿对象对账、复制或�
 - 文件夹只允许空目录删除，文件删除为永久删除
 - 生产环境需要 HTTPS 反向代理并设置 `COOKIE_SECURE=true`
 - Pause/Resume 支持当前页面生命周期。刷新会丢失浏览器 `File` 对象，本版本需重新开始；服务端 Session 与 chunks 会保留，为后续“重新选择相同文件恢复”流程提供基础。
+- Storage Node 当前仍是在同一 API 进程中的独立本地目录实现。V0.3.1 明确不包含远程 RPC、repair、rebalancing、一致性哈希、Leader Election 或共识协议。
+- 三个节点全部由同一个 API 进程承载；API 退出时 A/B/C 会同时停止。这是本地多节点故障路径模拟，不是三个独立远程服务器。
+- 相对 `UPLOAD_ROOT` 固定以 monorepo workspace 根目录解析一次，不依赖 API 启动时的工作目录；文档默认路径对应 `apps/api/uploads` 的绝对路径。
+- 下载可在节点 DEAD、不健康、对象缺失或 stream 打开失败时切换副本；一旦已有响应字节发送给客户端，后续 stream 失败无法在同一 HTTP 响应中安全切换，客户端需要重新下载。
+
+## V0.3.1 分布式存储设计
+
+- Metadata Service 在 PostgreSQL 中维护文件、节点和副本位置
+- Storage A/B/C 使用隔离的文件系统根目录并实现与传输无关的 `StorageNode` 契约
+- 每个新文件必须先成功写入一个 PRIMARY 和一个 REPLICA，之后才发布 metadata
+- 每 10 秒模拟一次 heartbeat，超过 30 秒未更新的节点标记为 DEAD
+- 下载跳过 DEAD、运行时不健康或对象缺失的 Primary，自动回退 Replica
 
 ## V0.2 上传设计
 
@@ -255,4 +277,4 @@ V0.2 不具备跨数据库/文件系统事务、孤儿对象对账、复制或�
 - 独立的 Pause/Resume（以服务端缺失 chunk 为准）、永久 Cancel、启动清理与每小时过期 Session 清理
 - 网络错误和 5xx chunk 请求按 500/1000/2000 ms 退避重试，4xx 不重试
 
-旧 multipart 上传接口继续保留以兼容 V0.1 客户端。V0.2 仍严格保持单节点，不引入 Redis、消息队列、分布式锁、副本、S3 或 Storage Node 协调。
+旧 multipart 上传接口和 V0.2 文件继续兼容。V0.3.1 只加入本地副本模拟，不引入 Redis、消息队列、分布式锁、S3、远程 RPC 或 Storage Node 共识。
