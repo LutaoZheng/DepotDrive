@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { access, mkdir, rename, rm } from 'node:fs/promises';
+import { access, link, mkdir, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { Transform } from 'node:stream';
 import { once } from 'node:events';
@@ -31,7 +31,14 @@ export class LocalFileStorage implements FileStorage {
   async saveChunk({sessionId,chunkIndex,stream,expectedSizeBytes,expectedChecksum}:SaveChunkInput):Promise<StoredChunk>{
     const final=this.chunkPath(sessionId,chunkIndex);await mkdir(path.dirname(final),{recursive:true});const temp=`${final}.${randomUUID()}.part`;
     const hash=createHash('sha256');let sizeBytes=0;const meter=new Transform({transform(chunk,_enc,cb){sizeBytes+=chunk.length;hash.update(chunk);cb(null,chunk)}});
-    try{await pipeline(stream,meter,createWriteStream(temp,{flags:'wx'}));const checksum=hash.digest('hex');if(sizeBytes!==expectedSizeBytes)throw new Error('CHUNK_SIZE_MISMATCH');if(checksum!==expectedChecksum.toLowerCase())throw new Error('CHUNK_CHECKSUM_MISMATCH');await rename(temp,final);return{chunkIndex,sizeBytes,checksum};}
+    try{await pipeline(stream,meter,createWriteStream(temp,{flags:'wx'}));const checksum=hash.digest('hex');if(sizeBytes!==expectedSizeBytes)throw new Error('CHUNK_SIZE_MISMATCH');if(checksum!==expectedChecksum.toLowerCase())throw new Error('CHUNK_CHECKSUM_MISMATCH');
+      try { await link(temp,final); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        const existingHash=createHash('sha256');let existingSize=0;for await(const data of createReadStream(final)){const chunk=Buffer.isBuffer(data)?data:Buffer.from(data);existingSize+=chunk.length;existingHash.update(chunk)}
+        if(existingSize!==expectedSizeBytes||existingHash.digest('hex')!==expectedChecksum.toLowerCase())throw new Error('CHUNK_CONFLICT_DISK');
+      }
+      await rm(temp,{force:true});return{chunkIndex,sizeBytes,checksum};}
     catch(error){await rm(temp,{force:true}).catch(()=>undefined);throw error;}
   }
   async chunkExists(sessionId:string,chunkIndex:number){try{await access(this.chunkPath(sessionId,chunkIndex));return true}catch{return false}}

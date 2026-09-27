@@ -1,0 +1,3 @@
+export const formatBytes=(bytes:number)=>bytes<1024?`${bytes} B`:bytes<1024**2?`${(bytes/1024).toFixed(1)} KB`:bytes<1024**3?`${(bytes/1024**2).toFixed(1)} MB`:`${(bytes/1024**3).toFixed(2)} GB`;
+export const formatDate=(value:string|null)=>value?new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(new Date(value)):'Never';
+export const relativeTime=(value:string|null)=>{if(!value)return'Never';const seconds=Math.round((Date.now()-new Date(value).getTime())/1000);if(seconds<5)return'just now';if(seconds<60)return`${seconds}s ago`;if(seconds<3600)return`${Math.floor(seconds/60)}m ago`;return formatDate(value)};

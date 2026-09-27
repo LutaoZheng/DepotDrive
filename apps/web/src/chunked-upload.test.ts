@@ -3,18 +3,30 @@ import axios from 'axios';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CHUNK_SIZE_BYTES, MAX_UPLOAD_FILE_SIZE, type UploadSessionDto } from '@depot-drive/shared';
 import { api, parseApiError } from './api';
-import { calculateTransferMetrics, startChunkedUpload, uploadActionsForPhase, validateUploadFileSize, type ChunkedUploadProgress } from './chunked-upload';
+import { calculateTransferMetrics, forgetUpload, listPersistedUploads, persistUpload, startChunkedUpload, uploadActionsForPhase, uploadIdentity, validateUploadFileSize, type ChunkedUploadProgress } from './chunked-upload';
 
 const id = '11111111-1111-4111-8111-111111111111';
 const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 function session(file: File, completedChunks: UploadSessionDto['completedChunks'] = []): UploadSessionDto {
-  return { id, folderId: null, name: file.name, mimeType: file.type, sizeBytes: file.size, fileChecksum: '', chunkSizeBytes: 3, totalChunks: Math.ceil(file.size / 3), status: 'ACTIVE', expiresAt: new Date(Date.now() + 10_000).toISOString(), completedChunks };
+  return { id, folderId: null, name: file.name, mimeType: file.type, sizeBytes: file.size, fileChecksum: '', clientUploadId: null, lastModified: file.lastModified, chunkSizeBytes: 3, totalChunks: Math.ceil(file.size / 3), status: 'ACTIVE', expiresAt: new Date(Date.now() + 10_000).toISOString(), completedChunks };
 }
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
 
-afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('chunked upload controls', () => {
+  it('uses content metadata for a durable browser identity and persists only session metadata', () => {
+    const values = new Map<string, string>();
+    vi.stubGlobal('localStorage', { get length(){return values.size}, key(index:number){return [...values.keys()][index]??null}, getItem(key:string){return values.get(key)??null}, setItem(key:string,value:string){values.set(key,value)}, removeItem(key:string){values.delete(key)} });
+    const file = new File([Buffer.from('same')], 'same.txt', { lastModified: 123 });
+    const clientUploadId = uploadIdentity(file, digest(Buffer.from('same')));
+    expect(clientUploadId).not.toBe(uploadIdentity(new File([Buffer.from('other')], 'same.txt', { lastModified: 123 }), digest(Buffer.from('other'))));
+    persistUpload({ clientUploadId, uploadId: id, name: file.name, sizeBytes: file.size, lastModified: file.lastModified, fileChecksum: digest(Buffer.from('same')), updatedAt: new Date().toISOString() });
+    expect(listPersistedUploads()).toMatchObject([{ clientUploadId, uploadId: id, name: 'same.txt' }]);
+    forgetUpload(clientUploadId);
+    expect(listPersistedUploads()).toEqual([]);
+    vi.unstubAllGlobals();
+  });
   it('exposes Pause and Cancel while uploading, and Resume and Cancel while paused', () => {
     expect(uploadActionsForPhase('uploading')).toEqual(['pause', 'cancel']);
     expect(uploadActionsForPhase('paused')).toEqual(['resume', 'cancel']);
@@ -113,6 +125,6 @@ describe('upload size preflight', () => {
     const post = vi.spyOn(api, 'post'); const size = MAX_UPLOAD_FILE_SIZE + 1; const file = { name: 'too-large.bin', type: 'application/octet-stream', size } as File; const progress: ChunkedUploadProgress[] = [];
     const task = startChunkedUpload({ file, folderId: null, onProgress: value => progress.push(value) });
     await expect(task.promise).rejects.toSatisfy(error => parseApiError(error, 'Upload failed') === 'File exceeds the maximum allowed size.\nMaximum allowed size: 5 GB.');
-    expect(post).not.toHaveBeenCalled(); expect(progress.at(-1)).toEqual({ phase: 'failed', loadedBytes: 0, totalBytes: size, uploadedChunks: 0, totalChunks: Math.ceil(size / CHUNK_SIZE_BYTES) });
+    expect(post).not.toHaveBeenCalled(); expect(progress.at(-1)).toEqual({ phase: 'failed', loadedBytes: 0, totalBytes: size, uploadedChunks: 0, totalChunks: Math.ceil(size / CHUNK_SIZE_BYTES), activeWorkers: 0 });
   });
 });

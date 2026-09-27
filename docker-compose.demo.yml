@@ -1,0 +1,6 @@
+services:
+  api:
+    environment:
+      DEMO_MODE: "true"
+      DEMO_ADMIN_EMAIL: ${DEMO_ADMIN_EMAIL:-demo@depotdrive.local}
+      DEMO_ADMIN_PASSWORD: ${DEMO_ADMIN_PASSWORD:-DepotDemo123!}

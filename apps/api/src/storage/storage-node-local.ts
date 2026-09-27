@@ -5,6 +5,8 @@ import { LocalFileStorage } from './local-file-storage.js';
 import type { SaveFileInput } from './file-storage.js';
 import type { StorageNode } from './storage-node.js';
 import { once } from 'node:events';
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 
 async function directoryBytes(root: string): Promise<number> {
   let entries: Dirent[];
@@ -20,13 +22,21 @@ async function directoryBytes(root: string): Promise<number> {
 
 export class StorageNodeLocal implements StorageNode {
   private readonly storage: LocalFileStorage;
+  readonly endpoint: string;
   constructor(readonly id: string, readonly name: string, private readonly root: string, private readonly capacityBytes: number) {
     this.storage = new LocalFileStorage(root);
+    this.endpoint = `local://${id}`;
   }
   upload(input: SaveFileInput) { return this.storage.save(input); }
   async download(storageKey: string) { const stream = this.storage.createReadStream(storageKey); await once(stream, 'open'); return stream; }
   delete(storageKey: string) { return this.storage.delete(storageKey); }
   exists(storageKey: string) { return this.storage.exists(storageKey); }
+  async metadata(storageKey: string) {
+    if (!await this.exists(storageKey)) return null;
+    const hash = createHash('sha256'); let sizeBytes = 0;
+    for await (const value of createReadStream(this.storage.pathFor(storageKey))) { const chunk = Buffer.from(value); sizeBytes += chunk.length; hash.update(chunk); }
+    return { sizeBytes, checksum: hash.digest('hex') };
+  }
   async health() {
     try { await mkdir(this.root, { recursive: true }); return { alive: true, checkedAt: new Date() }; }
     catch { return { alive: false, checkedAt: new Date() }; }

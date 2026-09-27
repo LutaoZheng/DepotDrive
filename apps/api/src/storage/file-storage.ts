@@ -1,5 +1,5 @@
 import type { Readable } from 'node:stream';
-export interface SaveFileInput { stream: Readable; storageKey: string }
+export interface SaveFileInput { stream: Readable; storageKey: string; expectedSizeBytes?: number; expectedChecksum?: string; allowReplace?: boolean }
 export interface StoredFile { storageKey: string; sizeBytes: number; checksum: string }
 export interface SaveChunkInput { sessionId: string; chunkIndex: number; stream: Readable; expectedSizeBytes: number; expectedChecksum: string }
 export interface StoredChunk { chunkIndex: number; sizeBytes: number; checksum: string }

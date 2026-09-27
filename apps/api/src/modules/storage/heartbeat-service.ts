@@ -9,11 +9,11 @@ export class HeartbeatService {
     await Promise.all(this.registry.all().map(async node => {
       try {
         const [health, capacity] = await Promise.all([node.health(), node.capacity()]);
-        await this.metadata.recordHeartbeat(node.id, node.name, health.alive, capacity.capacityBytes, capacity.usedBytes, health.checkedAt);
+        await this.metadata.recordHeartbeat(node.id, node.name, node.endpoint, health.alive, capacity.capacityBytes, capacity.usedBytes, health.checkedAt);
       } catch (error) {
         this.logger.error({ error, storageNodeId: node.id }, 'Storage node heartbeat failed');
         const capacity = await node.capacity().catch(() => ({ capacityBytes: 0, usedBytes: 0 }));
-        await this.metadata.recordHeartbeat(node.id, node.name, false, capacity.capacityBytes || 1, capacity.usedBytes).catch(() => undefined);
+        await this.metadata.recordHeartbeat(node.id, node.name, node.endpoint, false, capacity.capacityBytes || 1, capacity.usedBytes).catch(() => undefined);
       }
     }));
     await this.metadata.markStaleDead();

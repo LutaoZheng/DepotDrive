@@ -11,11 +11,17 @@ model User {
   id             String          @id @default(uuid()) @db.Uuid
   email          String          @unique
   passwordHash   String
+  role           UserRole        @default(USER)
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
   folders        Folder[]
   files          File[]
   uploadSessions UploadSession[]
+}
+
+enum UserRole {
+  USER
+  ADMIN
 }
 
 enum UploadSessionStatus {
@@ -32,6 +38,8 @@ model UploadSession {
   mimeType       String
   sizeBytes      BigInt
   fileChecksum   String
+  clientUploadId String?
+  lastModified   BigInt?
   chunkSizeBytes Int
   totalChunks    Int
   status         UploadSessionStatus @default(ACTIVE)
@@ -41,9 +49,11 @@ model UploadSession {
   owner          User                @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   folder         Folder?             @relation(fields: [folderId], references: [id], onDelete: Restrict)
   chunks         UploadChunk[]
+  publishedFile  File?
 
   @@index([ownerId, expiresAt])
   @@index([expiresAt])
+  @@unique([ownerId, clientUploadId])
 }
 
 model UploadChunk {
@@ -85,18 +95,28 @@ model File {
   sizeBytes    BigInt
   storageKey   String        @unique
   checksum     String
+  status       FileStatus    @default(AVAILABLE)
+  uploadSessionId String?    @unique @db.Uuid
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
   owner        User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   folder       Folder?       @relation(fields: [folderId], references: [id], onDelete: Restrict)
+  uploadSession UploadSession? @relation(fields: [uploadSessionId], references: [id], onDelete: SetNull)
   replicas     FileReplica[]
+  operations   StorageOperation[]
 
   @@index([ownerId, folderId])
 }
 
+enum FileStatus {
+  PENDING
+  AVAILABLE
+  DELETING
+}
+
 enum StorageNodeStatus {
-  ALIVE
-  DEAD
+  HEALTHY
+  UNAVAILABLE
 }
 
 enum ReplicaRole {
@@ -107,15 +127,26 @@ enum ReplicaRole {
 model StorageNode {
   id            String            @id
   name          String            @unique
-  status        StorageNodeStatus @default(DEAD)
+  endpoint      String
+  status        StorageNodeStatus @default(UNAVAILABLE)
   capacityBytes BigInt
   usedBytes     BigInt            @default(0)
-  lastHeartbeat DateTime?
+  lastHeartbeatAt DateTime?
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
   replicas      FileReplica[]
+  operations    StorageOperation[]
 
-  @@index([status, lastHeartbeat])
+  @@index([status, lastHeartbeatAt])
+}
+
+enum ReplicaStatus {
+  PENDING
+  HEALTHY
+  MISSING
+  UNAVAILABLE
+  CORRUPT
+  DELETE_PENDING
 }
 
 model FileReplica {
@@ -124,11 +155,67 @@ model FileReplica {
   nodeId     String
   storageKey String
   role       ReplicaRole
+  status     ReplicaStatus @default(PENDING)
+  sizeBytes  BigInt
+  sha256     String
+  lastVerifiedAt DateTime?
   createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
   file       File        @relation(fields: [fileId], references: [id], onDelete: Cascade)
   node       StorageNode @relation(fields: [nodeId], references: [id], onDelete: Restrict)
+  operations StorageOperation[]
 
   @@unique([fileId, nodeId])
   @@index([nodeId, role])
   @@index([fileId, role])
+  @@index([status, lastVerifiedAt])
+}
+
+enum StorageOperationType {
+  CREATE_REPLICA
+  DELETE_REPLICA
+  REPAIR_REPLICA
+}
+
+enum StorageOperationStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+}
+
+model StorageOperation {
+  id            String                 @id @default(uuid()) @db.Uuid
+  type          StorageOperationType
+  status        StorageOperationStatus @default(PENDING)
+  fileId        String                 @db.Uuid
+  replicaId     String                 @db.Uuid
+  storageNodeId String
+  attempts      Int                    @default(0)
+  lastError     String?
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+  file          File                   @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  replica       FileReplica            @relation(fields: [replicaId], references: [id], onDelete: Cascade)
+  storageNode   StorageNode             @relation(fields: [storageNodeId], references: [id], onDelete: Restrict)
+
+  @@unique([type, replicaId])
+  @@index([status, updatedAt])
+  @@index([fileId, status])
+}
+
+model SystemEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+  type      String
+  result    String
+  message   String
+  fileId    String?  @db.Uuid
+  replicaId String?  @db.Uuid
+  nodeId    String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([fileId, createdAt])
+  @@index([nodeId, createdAt])
 }

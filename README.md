@@ -1,261 +1,181 @@
-# DepotDrive V0.3.1
+# DepotDrive V1.0 — Self-Healing Distributed Storage
 
 English | [简体中文](./README.zh-CN.md)
 
-## Overview
+DepotDrive is a Dropbox-like project built with React, TypeScript, Fastify, PostgreSQL, Prisma, and Docker Compose. It demonstrates two independent Storage Node processes/volumes, byte-level integrity verification, durable replica repair, and resumable 8 MiB chunk uploads.
 
-DepotDrive is a self-hosted private cloud drive. V0.3.1 separates metadata from binary storage and introduces three independently rooted storage nodes, two-copy replication, heartbeat-based failure detection, and replica download fallback.
+The finished React product includes authentication, a responsive Drive, a measured multi-file upload manager, file details, an administrator System Monitor, and a reliability timeline backed by real PostgreSQL events.
 
-## Features
+## Product UI
 
-- Register, sign in, sign out, and restore a cookie-based session
-- Browse root and arbitrarily nested folders with breadcrumbs
-- Create, rename, and delete empty folders
-- Split files into 8 MiB chunks, upload up to four chunks in parallel, resume missing chunks, and cancel uploads
-- Validate every chunk and the assembled file with SHA-256 before publishing metadata
-- Stream downloads; rename display metadata; delete metadata and disk content
-- Per-user storage totals, loading/error/empty states, and responsive Drive UI
-- Owner-scoped resource lookups that return 404 for another user's resources
-- Two copies per new file across Storage A/B/C with primary-to-replica download fallback
-- Storage-node heartbeat, 30-second failure detection, capacity accounting, and a live dashboard
+![My Drive file details](./docs/portfolio/screenshots/drive-file-details.png)
 
-## Technology
+![Live System Monitor](./docs/portfolio/screenshots/system-monitor.png)
 
-React, TypeScript, Vite, Tailwind CSS, React Router, TanStack Query, and Axios power the web app. The modular-monolith API uses Node.js, Fastify, Prisma, PostgreSQL, JWT, bcrypt, Zod, and multipart streams. npm workspaces manage the monorepo; Docker Compose runs the full stack.
+![Interactive Reliability Demo](./docs/portfolio/screenshots/reliability-demo.png)
+
+## Proven behavior
+
+- A file becomes `AVAILABLE` only after two independent nodes store verified complete replicas.
+- Downloads stage and streaming-hash a candidate before sending any bytes to the client.
+- Missing, same-size corrupted, unavailable, and healthy replicas have distinct persisted states.
+- A bad primary falls back to a verified replica and enqueues durable automatic repair.
+- Scrubbing periodically verifies oldest replicas and triggers repair.
+- `REPAIR_REPLICA` operations survive API restart and are idempotent.
+- Browser reload/network interruption/API restart preserve upload progress; reselecting the same file sends only missing chunks.
+- Real PostgreSQL, two real Storage Nodes, container outage, corruption, repair, duplicate resume, and 100 MiB restart-resume are covered by the default test suite.
 
 ## Architecture
 
-```mermaid
-flowchart TD
-  Web[React Web] --> API[Fastify Metadata Service]
-  API --> DB[(PostgreSQL File, Node and Replica Metadata)]
-  API --> Registry[Storage Node Registry]
-  Registry --> A[Storage Node A]
-  Registry --> B[Storage Node B]
-  Registry --> C[Storage Node C]
-  A --> AFS[(storage-nodes/A)]
-  B --> BFS[(storage-nodes/B)]
-  C --> CFS[(storage-nodes/C)]
-  Heartbeat[Heartbeat and Failure Detector] --> Registry
-  Heartbeat --> DB
-```
-
-The Fastify modular monolith currently hosts the Metadata Service, but binary storage is behind a transport-neutral `StorageNode` interface. `StorageNodeLocal` gives A/B/C separate roots today; later remote implementations can replace individual nodes without changing upload or download routes. `LocalFileStorage` remains the staging and V0.2 compatibility implementation.
-
-## Database ER diagram
-
-```mermaid
-erDiagram
-  User ||--o{ Folder : owns
-  User ||--o{ File : owns
-  User ||--o{ UploadSession : owns
-  Folder o|--o{ Folder : contains
-  Folder o|--o{ File : contains
-  Folder o|--o{ UploadSession : targets
-  UploadSession ||--o{ UploadChunk : contains
-  File ||--o{ FileReplica : has
-  StorageNode ||--o{ FileReplica : stores
-
-  User {
-    uuid id PK
-    string email UK
-    string passwordHash
-    datetime createdAt
-    datetime updatedAt
-  }
-
-  Folder {
-    uuid id PK
-    uuid ownerId FK
-    uuid parentId FK
-    string name
-    datetime createdAt
-    datetime updatedAt
-  }
-
-  File {
-    uuid id PK
-    uuid ownerId FK
-    uuid folderId FK
-    string name
-    string originalName
-    string mimeType
-    bigint sizeBytes
-    string storageKey UK
-    string checksum
-    datetime createdAt
-    datetime updatedAt
-  }
-
-  UploadSession {
-    uuid id PK
-    uuid ownerId FK
-    uuid folderId FK
-    bigint sizeBytes
-    string fileChecksum
-    int chunkSizeBytes
-    int totalChunks
-    string status
-    datetime expiresAt
-  }
-
-  UploadChunk {
-    uuid id PK
-    uuid uploadSessionId FK
-    int chunkIndex
-    int sizeBytes
-    string checksum
-  }
-```
-
-`Folder.parentId` and `File.folderId` are nullable for items at the drive root. Folder names are unique per owner and parent; the migration uses partial unique indexes to handle PostgreSQL `NULL` semantics at the root.
-
-## Project layout
-
 ```text
-apps/web             React client
-apps/api/src         Fastify modular monolith
-apps/api/prisma      schema and SQL migration
-apps/api/uploads     local development object root
-apps/api/tests       database-backed integration tests
-packages/shared      transport DTOs and validation constants
+React Web :5173
+  |
+Fastify API / Coordinator :3000 ─── PostgreSQL :5432
+  |                                  durable metadata + operations
+  ├── authenticated HTTP ── Storage Node A :4001 ── storage_a_data
+  └── authenticated HTTP ── Storage Node B :4002 ── storage_b_data
+
+API session/verification staging ── api_uploads_data
 ```
 
-## Local development
+The API never mounts Storage Node volumes. This is a single-host, single-Coordinator deployment; it does not claim multi-machine or multi-region fault tolerance.
 
-Requirements: Node.js 20+, npm, and PostgreSQL 15+.
+## Tech stack
+
+- React 19, TypeScript, Vite, React Query
+- Node.js and Fastify
+- PostgreSQL 16 and Prisma
+- Two Fastify Storage Node services with filesystem-backed named volumes
+- Docker Compose, Vitest and Playwright
+
+## Start locally
+
+Requirements: Docker with Compose; Node.js 20+ and npm for host tests/development.
+
+```bash
+git clone <repository-url>
+cd DepotDrive
+cp .env.example .env
+# Run `openssl rand -hex 32` twice, then paste the independent values
+# after JWT_SECRET= and STORAGE_INTERNAL_TOKEN= in .env.
+docker compose up -d --build --wait
+docker compose ps
+```
+
+Open `http://localhost:5173`. The API is `http://localhost:3000`. The API container automatically runs committed Prisma migrations.
+
+For the opt-in local interactive demo, use the override below. Production Compose does not expose demo mutations or create a demo administrator.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build --wait
+# Local defaults: demo@depotdrive.local / DepotDemo123!
+# Override DEMO_ADMIN_EMAIL and DEMO_ADMIN_PASSWORD as needed.
+```
+
+```bash
+docker compose stop           # retain data
+docker compose down --volumes # delete local data
+```
+
+## Host development
 
 ```bash
 cp .env.example .env
+# Set JWT_SECRET and STORAGE_INTERNAL_TOKEN to independent 32+ character random values.
 npm install
 npm run prisma:generate
-npm run prisma:migrate
+docker compose up -d postgres storage-node-a storage-node-b --wait
+npm run prisma:deploy -w @depot-drive/api
 npm run dev
 ```
 
-The web app is at `http://localhost:5173`; the API is at `http://localhost:3000`. Prisma reads `DATABASE_URL` from the environment. For a host-run API, either export `.env` variables in the shell or run it with an environment loader.
+`.env.example` uses node host ports 4001/4002. Full Compose overrides endpoints with service DNS names.
 
-## Docker
-
-```bash
-JWT_SECRET="replace-with-at-least-32-random-characters" docker compose up --build
-```
-
-Compose starts PostgreSQL with a healthcheck, waits before starting the API, applies committed migrations, and serves the frontend at `http://localhost:5173`. PostgreSQL and uploads use named volumes (`postgres_data`, `uploads_data`) and survive container recreation.
-
-## Environment variables
-
-| Variable | Purpose |
-|---|---|
-| `NODE_ENV` | `development`, `test`, or `production` |
-| `DATABASE_URL` | PostgreSQL connection string |
-| `JWT_SECRET` | JWT signing secret; at least 32 characters outside tests |
-| `API_PORT` | API listen port, default `3000` |
-| `WEB_ORIGIN` | Exact allowed browser CORS origin |
-| `COOKIE_SECURE` | Set `true` behind production HTTPS |
-| `JWT_SESSION_SECONDS` | JWT and cookie lifetime in seconds, default 604800 (7 days) |
-| `CHUNK_SIZE_BYTES` | Server-selected chunk size, default 8388608 (8 MiB) |
-| `UPLOAD_SESSION_TTL_SECONDS` | Resumable session lifetime, default 86400 (24 hours) |
-| `MAX_FILE_SIZE_BYTES` | Per-file upload limit, default 5368709120 bytes (5 GiB) |
-| `UPLOAD_ROOT` | Temporary/object storage root |
-| `VITE_API_BASE_URL` | Browser-visible API origin, embedded at web build time |
-
-Do not use the example or Compose fallback JWT secret in a real deployment.
-
-## Database and migrations
-
-Prisma models `User`, `Folder`, and `File` store accounts, hierarchy, and file metadata. Binary data is never placed in PostgreSQL. The initial migration includes partial unique indexes so root folders (whose `parentId` is `NULL`) also have per-user name uniqueness.
+## Quality gates
 
 ```bash
-npm run prisma:migrate       # development migration workflow
-npm run prisma:deploy -w @depot-drive/api  # apply committed migrations
-```
-
-## Tests and quality checks
-
-Integration tests use a disposable, dedicated PostgreSQL database identified by `TEST_DATABASE_URL`. Never point it at a database containing useful data because tests clear application tables.
-
-```bash
-TEST_DATABASE_URL=postgresql://depot:depot@localhost:5432/depot_drive_test npm test
 npm run typecheck
 npm run build
+npm test
 ```
 
-Without `TEST_DATABASE_URL`, database integration tests are explicitly skipped rather than silently using the development database.
+`npm test` builds disposable Storage Nodes, starts a dedicated PostgreSQL database, applies all migrations, runs unit plus real integration/fault tests, and removes the test environment. Unavailable infrastructure fails explicitly; tests do not silently skip.
 
-## API overview
+Latest verified result: **55 passed, 0 failed, 0 skipped** (15 API unit, 19 Web, 4 Storage Node, 15 PostgreSQL/Storage integration/fault, and 2 full-Compose Playwright browser tests).
 
-| Method | Endpoint | Purpose |
+The browser suite uploads and resumes a real 100 MiB file across refresh and API restart, proves it sends exactly the server-reported missing chunks, exercises node outage/fallback and complete-outage 503 semantics, injects byte corruption, and observes persisted corrupt/repair events. Monitoring is never mocked in this E2E path.
+
+## Reproduce Phase 2
+
+With full Compose running:
+
+```bash
+node scripts/phase2-demo.mjs
+```
+
+The script uploads 100 MiB, verifies two container-volume copies, flips one byte in Node A, proves `CORRUPT` detection and correct fallback, waits for automatic repair, verifies both hashes, interrupts a second 100 MiB upload at 7/13 chunks, restarts the API, sends only chunks 7–12, and verifies the final SHA-256.
+
+The deterministic demo SHA-256 is `412f60e4a630f1d60653186ad3d80f2a04e0e1ff779c21f46bf176e304c5a260`.
+
+## Design decisions
+
+- PostgreSQL is both authoritative metadata and the durable operation queue; V1 does not need Redis or a message broker.
+- Replica writes are idempotent and reconciliation-friendly because PostgreSQL and remote filesystems cannot share an ACID transaction.
+- Downloads are fully staged and hashed before response bytes begin. This favors demonstrable correctness over low time-to-first-byte.
+- Container/process/volume isolation makes node failures independently testable on one laptop without claiming physical-machine isolation.
+
+## Storage Node API
+
+Every route requires `Authorization: Bearer <STORAGE_INTERNAL_TOKEN>`.
+
+| Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/auth/register` | Create an account and session |
-| POST | `/api/auth/login` | Create a session |
-| GET | `/api/auth/me` | Current user |
-| POST | `/api/auth/logout` | Clear session |
-| GET/POST | `/api/folders` | List directory / create folder |
-| PATCH/DELETE | `/api/folders/:folderId` | Rename / delete empty folder |
-| GET | `/api/folders/:folderId/breadcrumbs` | Ancestor chain |
-| POST | `/api/files/upload` | Multipart streamed upload (`folderId`, then `file`) |
-| GET | `/api/files/:fileId/download` | Stream download |
-| PATCH/DELETE | `/api/files/:fileId` | Rename metadata / delete file |
-| GET | `/api/users/storage` | Current user's bytes used |
-| GET | `/api/storage/nodes` | Node health, capacity, heartbeat, primary and replica counts |
-| POST/GET | `/api/uploads` | Create-or-resume / list active upload sessions |
-| GET/DELETE | `/api/uploads/:uploadId` | Get progress / cancel and clean a session |
-| PUT | `/api/uploads/:uploadId/chunks/:chunkIndex` | Stream and verify one binary chunk |
-| POST | `/api/uploads/:uploadId/complete` | Assemble, verify, and publish the file |
+| `GET` | `/health` | Liveness and capacity |
+| `PUT` | `/objects/:objectKey` | Atomic streaming write; expected size/SHA-256 required |
+| `HEAD` | `/objects/:objectKey` | Persistent size/SHA-256 metadata |
+| `GET` | `/objects/:objectKey` | Object stream |
+| `DELETE` | `/objects/:objectKey` | Idempotent object deletion |
 
-Errors consistently use `{ "error": { "code": "...", "message": "..." } }`.
+Repair alone sends `X-Allow-Replace: true`. Fault endpoints exist only in the test Compose environment.
 
-## File storage design
+## Important configuration
 
-Legacy uploads still stream into `uploads/tmp/<uuid>.part`. V0.2 chunks are independently verified and atomically stored at `uploads/sessions/<sessionId>/chunks/<index>`. Completion reads chunks in index order without loading the full file, validates final size and SHA-256, then atomically moves the assembled object to `uploads/objects/ab/cd/<uuid>`. Session directories are removed after completion, cancellation, or expiry.
+| Variable | Default | Purpose |
+|---|---:|---|
+| `CHUNK_SIZE_BYTES` | 8388608 | 8 MiB chunks |
+| `UPLOAD_SESSION_TTL_SECONDS` | 86400 | Abandoned session lifetime |
+| `MAX_ACTIVE_UPLOAD_SESSIONS_PER_USER` | 20 | Per-user active session cap |
+| `HEARTBEAT_INTERVAL_MS` | 10000 | Node health probe interval |
+| `STORAGE_FAILURE_TIMEOUT_MS` | 30000 | Heartbeat freshness |
+| `REPAIR_INTERVAL_MS` | 30000 | Repair worker interval |
+| `REPAIR_UNAVAILABLE_GRACE_MS` | 300000 | Delay before outage replacement |
+| `SCRUB_INTERVAL_MS` | 21600000 | Six-hour scrub interval |
+| `SCRUB_BATCH_SIZE` | 10 | Replicas per scrub pass |
 
-## Security
+## Limitations
 
-- bcrypt cost 12 password hashing; normalized lowercase unique email
-- JWT in `HttpOnly`, `SameSite=Lax` cookie; configurable `Secure`
-- Exact-origin credentialed CORS and validated startup configuration
-- Zod input validation, filename length/traversal checks, and multipart size limits
-- Every resource lookup combines resource ID with authenticated owner ID
-- Cross-user access receives 404, avoiding resource-existence disclosure
-- Prisma parameterized queries and DTO mapping; password hashes/storage keys are not exposed
-- Generic production errors, no client stack traces, streamed I/O, and interrupted temp cleanup
-- MIME type is display/response metadata only and is not treated as trusted content classification
+- Reads use verified Coordinator staging, increasing time-to-first-byte and temporary disk use.
+- A browser refresh requires selecting the file again; only session metadata is persisted.
+- With exactly two nodes, a down node cannot be replaced until it returns; one healthy copy remains degraded.
+- One API Coordinator is supported. PostgreSQL operation claiming prevents obvious races but is not consensus.
+- All services still share one physical Docker host. No multi-region, S3, Kubernetes, Redis, Kafka, sharing, preview, search, or trash is claimed.
+- Demo node lifecycle and corruption are CLI-only by design. The API/Web never receive the Docker socket; web demo mutations are limited to authenticated same-origin scrub/repair.
 
-## Filesystem and Database Consistency
+## Documentation
 
-Chunk upload order is temporary chunk stream → size/checksum validation → atomic chunk move → chunk metadata insert. Completion atomically claims the session, streams chunks into an assembly temp file, validates it, then streams it to two distinct node roots. `File`, both `FileReplica` rows, and UploadSession removal are published in one database transaction. A failed transaction triggers deletion of both physical replicas and returns the session to ACTIVE; compensation deletion failures are logged with node and storage key.
-
-New-file deletion attempts every replica before deleting metadata. If any node deletion fails, the API returns `REPLICA_DELETE_FAILED` and retains the File/FileReplica rows so the failure remains traceable and deletion can be retried. A replica deleted successfully before another fails is recorded as temporarily missing. Legacy V0.2 files retain force-delete behavior on `LocalFileStorage`. There is no cross-system transaction or orphan reconciliation job, so operators should back up PostgreSQL and the uploads volume together.
-
-## Current limitations
-
-- Single API node and local filesystem only
-- Single file selection per task; no Range download, sharing, quotas, previews, search, or trash
-- Folder deletion is empty-only and file deletion is permanent
-- Cookies require an HTTPS reverse proxy plus `COOKIE_SECURE=true` in production
-- Upload progress reports browser-to-server transfer progress, not post-upload database completion
-- Pause/resume works while the page remains open. A refresh loses the browser `File` object, so the user must start again in this release; the server session and chunks remain available for a future same-file picker recovery flow.
-- Storage nodes are local-directory implementations in one API process. V0.3.1 intentionally has no remote RPC, repair, rebalancing, consistent hashing, leader election, or consensus.
-- A single API process owns all three simulated local nodes; stopping that process stops A, B, and C together. This is fault-path simulation, not three independent remote servers.
-- Relative `UPLOAD_ROOT` values are resolved once against the monorepo workspace root, not the process working directory. The documented default is the absolute equivalent of `apps/api/uploads`.
-- Download fallback covers node status, health, missing objects, and failures while opening a stream. Once response bytes have reached the client, a later stream failure cannot safely switch replicas in the same HTTP response; the client must retry the download.
-
-## V0.3.1 distributed storage design
-
-- Metadata Service owns file, node, and replica placement records in PostgreSQL
-- Storage A/B/C use isolated filesystem roots and implement the transport-neutral `StorageNode` contract
-- Every new file requires a PRIMARY and one REPLICA before metadata publication
-- Heartbeats run every 10 seconds; metadata older than 30 seconds is marked DEAD
-- Downloads skip DEAD/unhealthy/missing primary content and fall back to the replica
-
-## V0.2 upload design
-
-- Client-side incremental final SHA-256 calculation
-- 8 MiB chunks and four concurrent upload workers
-- Server-side UploadSession/UploadChunk persistence and missing-chunk discovery
-- Per-chunk SHA-256, ordered streaming assembly, and final SHA-256 validation
-- Independent pause/resume (server-authoritative missing-chunk reconciliation), explicit permanent cancellation, and startup/hourly expired-session cleanup
-- Network and 5xx chunk retries use 500/1000/2000 ms backoff; 4xx responses are not retried
-
-The legacy multipart endpoint and V0.2 files remain supported for backward compatibility. V0.3.1 adds local replica simulation without Redis, queues, distributed locks, S3, remote RPC, or storage-node consensus.
+- [Phase 2 implementation](./docs/v1/PHASE2_IMPLEMENTATION.md)
+- [Self-healing design](./docs/v1/SELF_HEALING_DESIGN.md)
+- [Resumable upload design](./docs/v1/RESUMABLE_UPLOAD_DESIGN.md)
+- [Phase 2 test results](./docs/v1/PHASE2_TEST_RESULTS.md)
+- [Phase 2 demo](./docs/v1/PHASE2_DEMO.md)
+- [Updated architecture](./docs/v1/UPDATED_ARCHITECTURE.md)
+- [Frontend implementation](./docs/portfolio/FRONTEND_IMPLEMENTATION.md)
+- [Final test results](./docs/portfolio/FRONTEND_TEST_RESULTS.md)
+- [Interactive demo guide](./docs/portfolio/INTERACTIVE_DEMO.md)
+- [Resume claim verification](./docs/portfolio/RESUME_VERIFICATION.md)
+- [75-second video script](./docs/portfolio/DEMO_VIDEO_SCRIPT.md)
+- [Final Git audit](./docs/release/GIT_AUDIT.md)
+- [Security audit](./docs/release/SECURITY_AUDIT.md)
+- [Manual acceptance checklist](./docs/release/MANUAL_ACCEPTANCE.md)
+- [Final release audit](./docs/release/FINAL_RELEASE_AUDIT.md)
+- [Original audit](./docs/audit/AUDIT_REPORT.md)

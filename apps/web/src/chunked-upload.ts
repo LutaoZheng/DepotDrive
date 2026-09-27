@@ -17,6 +17,7 @@ export interface ChunkedUploadProgress {
   totalBytes: number;
   uploadedChunks: number;
   totalChunks: number;
+  activeWorkers: number;
   speedBytesPerSecond?: number;
   etaSeconds?: number;
 }
@@ -26,6 +27,33 @@ export interface ChunkedUploadTask {
   resume(): void;
   cancel(): Promise<void>;
 }
+export interface PersistedUpload {
+  clientUploadId: string;
+  uploadId: string;
+  name: string;
+  sizeBytes: number;
+  lastModified: number;
+  fileChecksum: string;
+  updatedAt: string;
+}
+const uploadStoragePrefix = 'depot-drive:upload:v1:';
+const storageAvailable = () => typeof localStorage !== 'undefined';
+export function uploadIdentity(file: Pick<File, 'name' | 'size' | 'lastModified'>, checksum: string) {
+  return `${checksum.toLowerCase()}:${file.size}:${file.lastModified}:${file.name}`;
+}
+function persistedKey(clientUploadId: string) { return `${uploadStoragePrefix}${clientUploadId}`; }
+export function listPersistedUploads(): PersistedUpload[] {
+  if (!storageAvailable()) return [];
+  const records: PersistedUpload[] = [];
+  for (let index = 0; index < localStorage.length; index++) {
+    const key = localStorage.key(index);
+    if (!key?.startsWith(uploadStoragePrefix)) continue;
+    try { records.push(JSON.parse(localStorage.getItem(key) ?? '') as PersistedUpload); } catch { localStorage.removeItem(key); }
+  }
+  return records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+export function persistUpload(record: PersistedUpload) { if (storageAvailable()) localStorage.setItem(persistedKey(record.clientUploadId), JSON.stringify(record)); }
+export function forgetUpload(clientUploadId: string) { if (storageAvailable()) localStorage.removeItem(persistedKey(clientUploadId)); }
 export function uploadActionsForPhase(phase: UploadPhase): Array<'pause' | 'resume' | 'cancel'> {
   if (phase === 'uploading') return ['pause', 'cancel'];
   if (phase === 'paused') return ['resume', 'cancel'];
@@ -80,6 +108,7 @@ export function startChunkedUpload(options: { file: File; folderId: string | nul
   const { file, folderId, onProgress } = options;
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE_BYTES);
   let uploadId: string | undefined;
+  let clientUploadId: string | undefined;
   let session: UploadSessionDto | undefined;
   let roundController = new AbortController();
   let paused = false;
@@ -89,6 +118,7 @@ export function startChunkedUpload(options: { file: File; folderId: string | nul
   let completedSizes = new Map<number, number>();
   let inFlightSizes = new Map<number, number>();
   let samples: SpeedSample[] = [];
+  let activeWorkers = 0;
 
   const completedBytes = () => Array.from(completedSizes.values()).reduce((sum, size) => sum + size, 0);
   const emit = (phase: UploadPhase, includeInFlight = true) => {
@@ -98,13 +128,13 @@ export function startChunkedUpload(options: { file: File; folderId: string | nul
       samples.push({ at: now, bytes: loadedBytes });
       samples = samples.filter(sample => now - sample.at <= 10_000);
     }
-    onProgress({ phase, loadedBytes, totalBytes: file.size, uploadedChunks: completedSizes.size, totalChunks: session?.totalChunks ?? totalChunks, ...(phase === 'uploading' ? calculateTransferMetrics(samples, file.size) : {}) });
+    onProgress({ phase, loadedBytes, totalBytes: file.size, uploadedChunks: completedSizes.size, totalChunks: session?.totalChunks ?? totalChunks, activeWorkers, ...(phase === 'uploading' ? calculateTransferMetrics(samples, file.size) : {}) });
   };
 
   try {
     validateUploadFileSize(file.size);
   } catch (error) {
-    onProgress({ phase: 'failed', loadedBytes: 0, totalBytes: file.size, uploadedChunks: 0, totalChunks });
+    onProgress({ phase: 'failed', loadedBytes: 0, totalBytes: file.size, uploadedChunks: 0, totalChunks, activeWorkers: 0 });
     return { promise: Promise.reject(error), pause() {}, resume() {}, async cancel() {} };
   }
 
@@ -148,7 +178,10 @@ export function startChunkedUpload(options: { file: File; folderId: string | nul
         if (paused || cancelled || signal.aborted) throw abortError('Upload interrupted');
         const index = missing[cursor++];
         if (index === undefined) return;
-        await uploadChunk(index, activeSession, signal);
+        activeWorkers++;
+        emit('uploading');
+        try { await uploadChunk(index, activeSession, signal); }
+        finally { activeWorkers--; if (!paused && !cancelled) emit('uploading'); }
       }
     }
     emit('uploading');
@@ -156,12 +189,14 @@ export function startChunkedUpload(options: { file: File; folderId: string | nul
   }
 
   const promise = (async () => {
-    onProgress({ phase: 'hashing', loadedBytes: 0, totalBytes: file.size, uploadedChunks: 0, totalChunks });
-    const fileChecksum = await hashFile(file, loadedBytes => onProgress({ phase: 'hashing', loadedBytes, totalBytes: file.size, uploadedChunks: 0, totalChunks }), roundController.signal);
+    onProgress({ phase: 'hashing', loadedBytes: 0, totalBytes: file.size, uploadedChunks: 0, totalChunks, activeWorkers: 0 });
+    const fileChecksum = await hashFile(file, loadedBytes => onProgress({ phase: 'hashing', loadedBytes, totalBytes: file.size, uploadedChunks: 0, totalChunks, activeWorkers: 0 }), roundController.signal);
     if (cancelled) throw abortError('Upload cancelled');
-    const created = await api.post<CreateUploadSessionResponse>('/api/uploads', { folderId, name: file.name, mimeType: file.type || 'application/octet-stream', sizeBytes: file.size, fileChecksum }, { signal: roundController.signal });
+    clientUploadId = uploadIdentity(file, fileChecksum);
+    const created = await api.post<CreateUploadSessionResponse>('/api/uploads', { folderId, name: file.name, mimeType: file.type || 'application/octet-stream', sizeBytes: file.size, fileChecksum, clientUploadId, lastModified: file.lastModified }, { signal: roundController.signal });
     session = created.data.upload;
     uploadId = session.id;
+    persistUpload({ clientUploadId, uploadId, name: file.name, sizeBytes: file.size, lastModified: file.lastModified, fileChecksum, updatedAt: new Date().toISOString() });
     completedSizes = new Map(session.completedChunks.map(chunk => [chunk.chunkIndex, chunk.sizeBytes]));
 
     while (true) {
@@ -189,13 +224,14 @@ export function startChunkedUpload(options: { file: File; folderId: string | nul
 
     emit('completing', false);
     const response = await api.post<{ file: FileDto }>(`/api/uploads/${session.id}/complete`, undefined, { signal: roundController.signal });
+    if (clientUploadId) forgetUpload(clientUploadId);
     terminal = true;
-    onProgress({ phase: 'complete', loadedBytes: file.size, totalBytes: file.size, uploadedChunks: session.totalChunks, totalChunks: session.totalChunks });
+    onProgress({ phase: 'complete', loadedBytes: file.size, totalBytes: file.size, uploadedChunks: session.totalChunks, totalChunks: session.totalChunks, activeWorkers: 0 });
     return response.data.file;
   })().catch(error => {
     terminal = true;
-    if (cancelled) onProgress({ phase: 'cancelled', loadedBytes: 0, totalBytes: file.size, uploadedChunks: 0, totalChunks });
-    else if (!paused) onProgress({ phase: 'failed', loadedBytes: completedBytes(), totalBytes: file.size, uploadedChunks: completedSizes.size, totalChunks: session?.totalChunks ?? totalChunks });
+    if (cancelled) onProgress({ phase: 'cancelled', loadedBytes: 0, totalBytes: file.size, uploadedChunks: 0, totalChunks, activeWorkers: 0 });
+    else if (!paused) onProgress({ phase: 'failed', loadedBytes: completedBytes(), totalBytes: file.size, uploadedChunks: completedSizes.size, totalChunks: session?.totalChunks ?? totalChunks, activeWorkers: 0 });
     throw error;
   });
 
@@ -222,6 +258,7 @@ export function startChunkedUpload(options: { file: File; folderId: string | nul
       roundController.abort();
       wakeResume?.();
       if (uploadId) await api.delete(`/api/uploads/${uploadId}`).catch(() => undefined);
+      if (clientUploadId) forgetUpload(clientUploadId);
     },
   };
 }

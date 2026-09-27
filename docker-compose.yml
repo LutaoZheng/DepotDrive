@@ -10,35 +10,81 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+
+  storage-node-a:
+    build:
+      context: .
+      dockerfile: apps/storage-node/Dockerfile
+    environment:
+      STORAGE_NODE_ID: node-a
+      STORAGE_NODE_NAME: Storage Node A
+      STORAGE_NODE_PORT: 4000
+      STORAGE_ROOT: /data
+      STORAGE_INTERNAL_TOKEN: ${STORAGE_INTERNAL_TOKEN:?Set STORAGE_INTERNAL_TOKEN in .env}
+      STORAGE_NODE_CAPACITY_BYTES: 107374182400
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --header=\"Authorization: Bearer $${STORAGE_INTERNAL_TOKEN}\" -O - http://127.0.0.1:4000/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports: ["127.0.0.1:4001:4000"]
+    volumes: ["storage_a_data:/data"]
+
+  storage-node-b:
+    build:
+      context: .
+      dockerfile: apps/storage-node/Dockerfile
+    environment:
+      STORAGE_NODE_ID: node-b
+      STORAGE_NODE_NAME: Storage Node B
+      STORAGE_NODE_PORT: 4000
+      STORAGE_ROOT: /data
+      STORAGE_INTERNAL_TOKEN: ${STORAGE_INTERNAL_TOKEN:?Set STORAGE_INTERNAL_TOKEN in .env}
+      STORAGE_NODE_CAPACITY_BYTES: 107374182400
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --header=\"Authorization: Bearer $${STORAGE_INTERNAL_TOKEN}\" -O - http://127.0.0.1:4000/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports: ["127.0.0.1:4002:4000"]
+    volumes: ["storage_b_data:/data"]
+
   api:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
     depends_on:
-      postgres:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
+      storage-node-a: { condition: service_healthy }
+      storage-node-b: { condition: service_healthy }
     environment:
       NODE_ENV: production
       DATABASE_URL: postgresql://depot:depot@postgres:5432/depot_drive
-      JWT_SECRET: ${JWT_SECRET:-development-only-secret-change-me-123456}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       API_PORT: 3000
       WEB_ORIGIN: http://localhost:5173
       COOKIE_SECURE: "false"
       JWT_SESSION_SECONDS: 604800
       CHUNK_SIZE_BYTES: 8388608
       UPLOAD_SESSION_TTL_SECONDS: 86400
+      MAX_ACTIVE_UPLOAD_SESSIONS_PER_USER: 20
       MAX_FILE_SIZE_BYTES: 5368709120
       UPLOAD_ROOT: /data/uploads
-      STORAGE_NODE_CAPACITY_BYTES: 107374182400
+      STORAGE_NODE_ENDPOINTS: node-a|Storage Node A|http://storage-node-a:4000,node-b|Storage Node B|http://storage-node-b:4000
+      STORAGE_INTERNAL_TOKEN: ${STORAGE_INTERNAL_TOKEN:?Set STORAGE_INTERNAL_TOKEN in .env}
+      STORAGE_REQUEST_TIMEOUT_MS: 15000
       HEARTBEAT_INTERVAL_MS: 10000
       STORAGE_FAILURE_TIMEOUT_MS: 30000
-    ports: ["3000:3000"]
-    volumes:
-      - uploads_data:/data/uploads
+      REPAIR_INTERVAL_MS: 3000
+      REPAIR_UNAVAILABLE_GRACE_MS: 30000
+      REPAIR_BATCH_SIZE: 10
+      SCRUB_INTERVAL_MS: 3600000
+      SCRUB_BATCH_SIZE: 10
+    ports: ["127.0.0.1:3000:3000"]
+    volumes: ["api_uploads_data:/data/uploads"]
+
   web:
     build:
       context: .
@@ -46,7 +92,10 @@ services:
       args:
         VITE_API_BASE_URL: http://localhost:3000
     depends_on: [api]
-    ports: ["5173:80"]
+    ports: ["127.0.0.1:5173:80"]
+
 volumes:
   postgres_data:
-  uploads_data:
+  api_uploads_data:
+  storage_a_data:
+  storage_b_data:

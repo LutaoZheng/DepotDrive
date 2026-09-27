@@ -5,9 +5,17 @@ dist/
 .env.*
 !.env.example
 coverage/
+playwright-report/
+test-results/
+/uploads/
+*.sqlite
+*.sqlite3
+*.db
 *.log
 *.tsbuildinfo
 .DS_Store
+.idea/
+.vscode/
 apps/api/uploads/*
 !apps/api/uploads/.gitkeep
 apps/api/apps/api/uploads/

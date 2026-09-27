@@ -21,6 +21,8 @@ export function uploadSessionDto(session: SessionWithChunks): UploadSessionDto {
     mimeType: session.mimeType,
     sizeBytes: Number(session.sizeBytes),
     fileChecksum: session.fileChecksum,
+    clientUploadId: session.clientUploadId,
+    lastModified: session.lastModified === null ? null : Number(session.lastModified),
     chunkSizeBytes: session.chunkSizeBytes,
     totalChunks: session.totalChunks,
     status: session.status,
@@ -30,7 +32,7 @@ export function uploadSessionDto(session: SessionWithChunks): UploadSessionDto {
 }
 
 export class UploadService {
-  constructor(private storage: FileStorage, private replicas: ReplicaService, private metadata: StorageMetadataService, private options: { chunkSizeBytes: number; maxFileSizeBytes: number; ttlSeconds: number }) {}
+  constructor(private storage: FileStorage, private replicas: ReplicaService, private metadata: StorageMetadataService, private options: { chunkSizeBytes: number; maxFileSizeBytes: number; ttlSeconds: number; maxActiveSessionsPerUser: number }) {}
 
   private expiresAt() { return new Date(Date.now() + this.options.ttlSeconds * 1000); }
   private async ownedSession(id: string, ownerId: string) {
@@ -47,10 +49,23 @@ export class UploadService {
     if(input.folderId&&!await prisma.folder.findFirst({where:{id:input.folderId,ownerId}}))throw new AppError(404,'FOLDER_NOT_FOUND','Folder not found');
     if(input.sizeBytes<0||input.sizeBytes>this.options.maxFileSizeBytes)throw new AppError(413,'FILE_TOO_LARGE','File exceeds the maximum allowed size');
     if(!sha256Pattern.test(input.fileChecksum))throw new AppError(400,'INVALID_CHECKSUM','A valid SHA-256 checksum is required');
-    const existing=await prisma.uploadSession.findFirst({where:{ownerId,folderId:input.folderId,name:input.name,sizeBytes:BigInt(input.sizeBytes),fileChecksum:input.fileChecksum.toLowerCase(),status:UploadSessionStatus.ACTIVE,expiresAt:{gt:new Date()}},include:{chunks:true},orderBy:{createdAt:'desc'}});
+    if(input.clientUploadId){
+      const identified=await prisma.uploadSession.findUnique({where:{ownerId_clientUploadId:{ownerId,clientUploadId:input.clientUploadId}},include:{chunks:true}});
+      if(identified){
+        if(identified.expiresAt<=new Date()){await this.storage.deleteUploadSession(identified.id);await prisma.uploadSession.delete({where:{id:identified.id}})}
+        else {
+          const matches=identified.folderId===input.folderId&&identified.name===input.name&&Number(identified.sizeBytes)===input.sizeBytes&&identified.fileChecksum===input.fileChecksum.toLowerCase()&&Number(identified.lastModified??0n)===(input.lastModified??0);
+          if(!matches)throw new AppError(409,'UPLOAD_IDENTITY_CONFLICT','Upload identity belongs to different file metadata');
+          return uploadSessionDto(identified);
+        }
+      }
+    }
+    const existing=await prisma.uploadSession.findFirst({where:{ownerId,folderId:input.folderId,name:input.name,sizeBytes:BigInt(input.sizeBytes),fileChecksum:input.fileChecksum.toLowerCase(),status:UploadSessionStatus.ACTIVE,expiresAt:{gt:new Date()},...(input.clientUploadId?{clientUploadId:input.clientUploadId}:{clientUploadId:null})},include:{chunks:true},orderBy:{createdAt:'desc'}});
     if(existing)return uploadSessionDto(existing);
+    const activeSessions=await prisma.uploadSession.count({where:{ownerId,status:UploadSessionStatus.ACTIVE,expiresAt:{gt:new Date()}}});
+    if(activeSessions>=this.options.maxActiveSessionsPerUser)throw new AppError(429,'UPLOAD_SESSION_LIMIT','Too many active upload sessions');
     const totalChunks=Math.ceil(input.sizeBytes/this.options.chunkSizeBytes);
-    const session=await prisma.uploadSession.create({data:{ownerId,folderId:input.folderId,name:input.name,originalName:input.name,mimeType:input.mimeType||'application/octet-stream',sizeBytes:BigInt(input.sizeBytes),fileChecksum:input.fileChecksum.toLowerCase(),chunkSizeBytes:this.options.chunkSizeBytes,totalChunks,expiresAt:this.expiresAt()},include:{chunks:true}});
+    const session=await prisma.uploadSession.create({data:{ownerId,folderId:input.folderId,name:input.name,originalName:input.name,mimeType:input.mimeType||'application/octet-stream',sizeBytes:BigInt(input.sizeBytes),fileChecksum:input.fileChecksum.toLowerCase(),clientUploadId:input.clientUploadId,lastModified:input.lastModified===undefined?null:BigInt(input.lastModified),chunkSizeBytes:this.options.chunkSizeBytes,totalChunks,expiresAt:this.expiresAt()},include:{chunks:true}});
     return uploadSessionDto(session);
   }
 
@@ -66,28 +81,29 @@ export class UploadService {
     if(existing){stream.resume();if(existing.checksum===checksum.toLowerCase()&&existing.sizeBytes===expectedSize&&await this.storage.chunkExists(id,index))return existing;throw new AppError(409,'CHUNK_CONFLICT','Chunk already exists with different metadata');}
     let stored;
     try{stored=await this.storage.saveChunk({sessionId:id,chunkIndex:index,stream,expectedSizeBytes:expectedSize,expectedChecksum:checksum});}
-    catch(error){const message=error instanceof Error?error.message:'';if(message==='CHUNK_SIZE_MISMATCH')throw new AppError(400,'CHUNK_SIZE_MISMATCH','Chunk size does not match');if(message==='CHUNK_CHECKSUM_MISMATCH')throw new AppError(422,'CHUNK_CHECKSUM_MISMATCH','Chunk checksum does not match');throw error;}
+    catch(error){const message=error instanceof Error?error.message:'';if(message==='CHUNK_SIZE_MISMATCH')throw new AppError(400,'CHUNK_SIZE_MISMATCH','Chunk size does not match');if(message==='CHUNK_CHECKSUM_MISMATCH')throw new AppError(422,'CHUNK_CHECKSUM_MISMATCH','Chunk checksum does not match');if(message==='CHUNK_CONFLICT_DISK')throw new AppError(409,'CHUNK_CONFLICT','Chunk already exists with different content');throw error;}
     try{return await prisma.uploadChunk.create({data:{uploadSessionId:id,chunkIndex:index,sizeBytes:stored.sizeBytes,checksum:stored.checksum}});}
     catch(error){if(error instanceof Prisma.PrismaClientKnownRequestError&&error.code==='P2002'){const winner=await prisma.uploadChunk.findUnique({where:{uploadSessionId_chunkIndex:{uploadSessionId:id,chunkIndex:index}}});if(winner&&winner.checksum===stored.checksum)return winner;}throw error;}
   }
 
   async complete(ownerId:string,id:string){
-    const session=await this.ownedSession(id,ownerId);this.ensureActive(session);
+    const session=await this.ownedSession(id,ownerId);
+    if(session.status===UploadSessionStatus.COMPLETING){const pending=await prisma.file.findUnique({where:{uploadSessionId:id}});if(!pending)throw new AppError(409,'UPLOAD_NOT_ACTIVE','Upload completion is already in progress');return fileDto(await this.replicas.publishPrepared(pending.id));}
+    this.ensureActive(session);
     if(session.chunks.length!==session.totalChunks)throw new AppError(409,'UPLOAD_INCOMPLETE','Not all chunks have been uploaded');
     for(let index=0;index<session.totalChunks;index++)if(!session.chunks.some(c=>c.chunkIndex===index)||!await this.storage.chunkExists(id,index))throw new AppError(409,'UPLOAD_INCOMPLETE',`Chunk ${index} is missing`);
     const claimed=await prisma.uploadSession.updateMany({where:{id,ownerId,status:UploadSessionStatus.ACTIVE},data:{status:UploadSessionStatus.COMPLETING,expiresAt:this.expiresAt()}});if(claimed.count!==1)throw new AppError(409,'UPLOAD_NOT_ACTIVE','Upload session is not active');
     const storageKey=randomUUID();
+    let preparedFileId:string|undefined;
     try{
       const stored=await this.storage.assembleChunks({sessionId:id,totalChunks:session.totalChunks,storageKey,expectedSizeBytes:Number(session.sizeBytes),expectedChecksum:session.fileChecksum});
-      const placements=await this.replicas.replicateFrom(this.storage,storageKey);
-      try {
-        const file=await prisma.$transaction(async tx=>{const created=await tx.file.create({data:{ownerId,folderId:session.folderId,name:session.name,originalName:session.originalName,mimeType:session.mimeType,sizeBytes:BigInt(stored.sizeBytes),storageKey,checksum:stored.checksum,replicas:{create:this.metadata.replicaCreateData(placements)}}});await tx.uploadSession.delete({where:{id}});return created;});
-        await this.storage.delete(storageKey).catch(()=>undefined);await this.storage.deleteUploadSession(id).catch(()=>undefined);return fileDto(file);
-      } catch(error) { await this.replicas.deletePlacements(placements); throw error; }
-    }catch(error){await this.storage.delete(storageKey).catch(()=>undefined);await prisma.uploadSession.updateMany({where:{id,ownerId,status:UploadSessionStatus.COMPLETING},data:{status:UploadSessionStatus.ACTIVE,expiresAt:this.expiresAt()}}).catch(()=>undefined);const message=error instanceof Error?error.message:'';if(message==='FILE_SIZE_MISMATCH')throw new AppError(422,'FILE_SIZE_MISMATCH','Assembled file size does not match');if(message==='FILE_CHECKSUM_MISMATCH')throw new AppError(422,'FILE_CHECKSUM_MISMATCH','Final file checksum does not match');throw error;}
+      const pending=await this.replicas.prepareFile({ownerId,folderId:session.folderId,name:session.name,originalName:session.originalName,mimeType:session.mimeType,sizeBytes:stored.sizeBytes,storageKey,checksum:stored.checksum,uploadSessionId:id});
+      preparedFileId=pending.id;
+      return fileDto(await this.replicas.publishPrepared(pending.id));
+    }catch(error){if(!preparedFileId){await this.storage.delete(storageKey).catch(()=>undefined);await prisma.uploadSession.updateMany({where:{id,ownerId,status:UploadSessionStatus.COMPLETING},data:{status:UploadSessionStatus.ACTIVE,expiresAt:this.expiresAt()}}).catch(()=>undefined);}const message=error instanceof Error?error.message:'';if(message==='FILE_SIZE_MISMATCH')throw new AppError(422,'FILE_SIZE_MISMATCH','Assembled file size does not match');if(message==='FILE_CHECKSUM_MISMATCH')throw new AppError(422,'FILE_CHECKSUM_MISMATCH','Final file checksum does not match');throw error;}
   }
 
   async cancel(ownerId:string,id:string){const session=await this.ownedSession(id,ownerId);if(session.status===UploadSessionStatus.COMPLETING)throw new AppError(409,'UPLOAD_COMPLETING','Upload is currently completing');await this.storage.deleteUploadSession(id);await prisma.uploadSession.delete({where:{id}})}
 }
 
-export async function cleanupExpiredUploads(storage:FileStorage,logger:FastifyBaseLogger){const expired=await prisma.uploadSession.findMany({where:{expiresAt:{lt:new Date()}},select:{id:true}});for(const session of expired){try{await storage.deleteUploadSession(session.id);await prisma.uploadSession.delete({where:{id:session.id}})}catch(error){logger.error({error,uploadSessionId:session.id},'Failed to clean expired upload session')}}return expired.length}
+export async function cleanupExpiredUploads(storage:FileStorage,logger:FastifyBaseLogger){const expired=await prisma.uploadSession.findMany({where:{expiresAt:{lt:new Date()},status:UploadSessionStatus.ACTIVE},select:{id:true}});for(const session of expired){try{await storage.deleteUploadSession(session.id);await prisma.uploadSession.delete({where:{id:session.id}})}catch(error){logger.error({error,uploadSessionId:session.id},'Failed to clean expired upload session')}}return expired.length}

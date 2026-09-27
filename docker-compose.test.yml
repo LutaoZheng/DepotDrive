@@ -1,0 +1,51 @@
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: depot_test
+      POSTGRES_PASSWORD: depot_test
+      POSTGRES_DB: depot_drive_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U depot_test -d depot_drive_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    ports: ["127.0.0.1:55432:5432"]
+
+  storage-test-a:
+    build:
+      context: .
+      dockerfile: apps/storage-node/Dockerfile
+    environment:
+      STORAGE_NODE_ID: node-a
+      STORAGE_NODE_NAME: Storage Node A
+      STORAGE_NODE_PORT: 4000
+      STORAGE_ROOT: /data
+      STORAGE_INTERNAL_TOKEN: integration-test-storage-token-at-least-32-characters
+      STORAGE_NODE_CAPACITY_BYTES: 1073741824
+      ENABLE_FAULT_INJECTION: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --header=\"Authorization: Bearer $${STORAGE_INTERNAL_TOKEN}\" -O - http://127.0.0.1:4000/health >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    ports: ["127.0.0.1:4101:4000"]
+
+  storage-test-b:
+    build:
+      context: .
+      dockerfile: apps/storage-node/Dockerfile
+    environment:
+      STORAGE_NODE_ID: node-b
+      STORAGE_NODE_NAME: Storage Node B
+      STORAGE_NODE_PORT: 4000
+      STORAGE_ROOT: /data
+      STORAGE_INTERNAL_TOKEN: integration-test-storage-token-at-least-32-characters
+      STORAGE_NODE_CAPACITY_BYTES: 1073741824
+      ENABLE_FAULT_INJECTION: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --header=\"Authorization: Bearer $${STORAGE_INTERNAL_TOKEN}\" -O - http://127.0.0.1:4000/health >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    ports: ["127.0.0.1:4102:4000"]
